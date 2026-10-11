@@ -15,6 +15,9 @@
   <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.0/firebase-firestore-compat.js"></script>
 
+  <!-- HTML to PDF Library (Offline + CDN fallback) -->
+  <script src="html2pdf.bundle.min.js"></script>
+
   <style>
     /* ==========================================================================
        1. CSS VARIABLES & DESIGN SYSTEM
@@ -1076,6 +1079,20 @@
       }[char]));
     }
 
+    /** Capitalize the first letter of each word (Title Case) */
+    function titleCase(val = '') {
+      if (!val) return '';
+      return String(val)
+        .split(' ')
+        .map(word => {
+          if (!word) return '';
+          // Keep common uppercase acronyms intact if they are already 2-4 uppercase letters
+          if (/^[A-Z0-9]{2,4}$/.test(word)) return word;
+          return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+        })
+        .join(' ');
+    }
+
     /** Convert input to valid finite number */
     function num(val) {
       const n = Number(val);
@@ -1567,7 +1584,7 @@
           <td><strong>${esc(inv.number)}</strong></td>
           <td>${esc(fmtDate(inv.date))}</td>
           <td>
-            <strong>${esc(inv.partyName || '—')}</strong>
+            <strong style="text-transform:capitalize;">${esc(titleCase(inv.partyName || '—'))}</strong>
             ${inv.gstin ? `<div class="smalltext">GSTIN: ${esc(inv.gstin)}</div>` : ''}
           </td>
           <td class="money">${money(inv.taxable)}</td>
@@ -1582,6 +1599,7 @@
             <div class="actions">
               <button class="secondary small" title="View Invoice" data-action="view" data-id="${inv.id}">View</button>
               <button class="secondary small" title="Edit Invoice" data-action="edit" data-id="${inv.id}">Edit</button>
+              <button class="primary small" title="Download Invoice" data-action="download" data-id="${inv.id}">Download</button>
               <button class="secondary small" title="Print Invoice" data-action="print" data-id="${inv.id}">Print</button>
               <button class="secondary small" title="Send WhatsApp" data-action="whatsapp" data-id="${inv.id}">WA</button>
               <button class="danger small" title="Delete / Cancel Invoice" data-action="delete" data-id="${inv.id}">×</button>
@@ -1926,7 +1944,7 @@
 
     /** Harvest current invoice state from form */
     function getFormInvoice() {
-      const partyName = document.getElementById('party-name').value.trim();
+      const partyName = titleCase(document.getElementById('party-name').value.trim());
       const state = document.getElementById('party-state').value;
       const placeOfSupply = document.getElementById('place-state').value;
       const calc = calculateInvoice() || {};
@@ -1944,11 +1962,11 @@
         partyId: (db.parties.find(p => p.name.toLowerCase() === partyName.toLowerCase()) || {}).id || '',
         gstin: document.getElementById('party-gstin').value.trim().toUpperCase(),
         phone: document.getElementById('party-phone').value.trim(),
-        address: document.getElementById('party-address').value.trim(),
+        address: titleCase(document.getElementById('party-address').value.trim()),
         state,
         stateCode: codeFor(state),
         placeOfSupply,
-        items: calc.items || invoiceDraft.items,
+        items: (calc.items || invoiceDraft.items).map(it => ({ ...it, description: titleCase(it.description) })),
         taxable: calc.taxable || 0,
         cgst: calc.cgst || 0,
         sgst: calc.sgst || 0,
@@ -2017,11 +2035,11 @@
               ${list.map(p => `
                 <tr>
                   <td>
-                    <strong>${esc(p.name)}</strong>
+                    <strong style="text-transform:capitalize;">${esc(titleCase(p.name))}</strong>
                   </td>
                   <td>${esc(p.gstin || '—')}</td>
-                  <td>${esc(p.address || '—')}</td>
-                  <td>${esc(p.state || '—')} ${p.stateCode ? `(${esc(p.stateCode)})` : ''}</td>
+                  <td style="text-transform:capitalize;">${esc(titleCase(p.address || '—'))}</td>
+                  <td style="text-transform:capitalize;">${esc(titleCase(p.state || '—'))} ${p.stateCode ? `(${esc(p.stateCode)})` : ''}</td>
                   <td>${esc(p.phone || '—')}</td>
                   <td>
                     <div class="actions">
@@ -2089,11 +2107,11 @@
               ${list.map(p => `
                 <tr>
                   <td>
-                    <strong>${esc(p.name)}</strong>
-                    ${p.description ? `<div class="smalltext">${esc(p.description)}</div>` : ''}
+                    <strong style="text-transform:capitalize;">${esc(titleCase(p.name))}</strong>
+                    ${p.description ? `<div class="smalltext" style="text-transform:capitalize;">${esc(titleCase(p.description))}</div>` : ''}
                   </td>
                   <td>${esc(p.hsn || '—')}</td>
-                  <td>${esc(p.unit || 'pcs')}</td>
+                  <td style="text-transform:capitalize;">${esc(titleCase(p.unit || 'pcs'))}</td>
                   <td class="money">${money(p.rate)}</td>
                   <td>${num(p.gstRate)}%</td>
                   <td>
@@ -2280,8 +2298,25 @@
        SECTION 6: PRINT & PDF TEMPLATE GENERATOR (EXACT TALLY A4 INVOICE)
        ========================================================================== */
     /** Open print-ready formatted GST Tax Invoice matching user's exact Tally layout */
-    function printInvoice(inv, isPreviewOnly = false) {
+    /** Generate standardized invoice filename: INV - XXX(Invoice no.) - Hasan Dharwala (Party Name), Indore ( City) */
+    function getInvoiceFileName(inv) {
+      const invNo = String(inv.number || '001').replace(/[\\/:*?"<>|]/g, '-').trim();
+      const party = titleCase(inv.partyName || 'Customer').replace(/[\\/:*?"<>|]/g, '-').trim();
+
+      let rawCity = inv.city;
+      if (!rawCity && inv.address) {
+        const parts = inv.address.split(',').map(s => s.trim()).filter(Boolean);
+        rawCity = parts[parts.length - 1];
+      }
+      const city = titleCase(rawCity || 'Indore').replace(/[\\/:*?"<>|]/g, '-').trim();
+      return `INV - ${invNo} - ${party}, ${city}`;
+    }
+
+    /** Generate standalone print-ready HTML for the invoice */
+    function generateInvoiceHtml(inv, customTitle = '') {
+      const docTitle = customTitle || getInvoiceFileName(inv);
       const s = inv.supplierSnapshot || db.settings;
+      const logoSrc = (s && s.logo) || (db.settings && db.settings.logo) || '';
       const placeOfSupply = inv.placeOfSupply || inv.state || 'Maharashtra';
       const supplierState = s.state || 'Madhya Pradesh';
       const isIntra = (placeOfSupply === supplierState);
@@ -2317,17 +2352,15 @@
       // Bank details fallback
       const bankName = s.bankName || 'Au Small Finance Bank';
       const acNo = s.accountNumber || '2402247861716940';
-      const branchIfsc = (s.branch ? s.branch + ' & ' : 'Jawahar Marg & ') + (s.ifsc || 'AUBL0002478');
+      const branchName = s.branch || 'Jawahar Marg';
+      const ifscCode = s.ifsc || 'AUBL0002478';
 
-      // Filler height: makes the items table expand to fill the A4 page vertically
-      // Dynamically scales to allow up to 20+ items on a single page
-      const fillerHeight = Math.max(20, 485 - (items.length * 25));
 
       const printHtml = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Tax Invoice - ${esc(inv.number)}</title>
+  <title>${esc(docTitle)}</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -2340,10 +2373,11 @@
       print-color-adjust: exact;
     }
     .print-wrapper {
-      width: 196mm;
+      width: 200mm;
+      height: 282mm;
       margin: 4px auto;
-      page-break-inside: avoid;
-      break-inside: avoid;
+      display: flex;
+      flex-direction: column;
     }
     .invoice-title {
       text-align: center;
@@ -2351,27 +2385,58 @@
       font-size: 16px;
       padding: 1px 0 2px;
       letter-spacing: 0.3px;
+      flex-shrink: 0;
     }
     .sheet {
       width: 100%;
       background: #fff;
       border: 1px solid #000;
       box-shadow: 0 4px 18px rgba(0,0,0,0.15);
-      page-break-inside: avoid;
-      break-inside: avoid;
+      flex: 1;
       display: flex;
       flex-direction: column;
+      overflow: hidden;
+    }
+    .items-section-wrap {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
     .top-section {
       display: flex;
       width: 100%;
       border-bottom: 1px solid #000;
+      flex-shrink: 0;
     }
     .top-left {
       width: 51%;
       border-right: 1px solid #000;
       display: flex;
       flex-direction: column;
+    }
+    .top-left .box-block {
+      flex: 1 1 0%;
+      min-height: 97px;
+      box-sizing: border-box;
+      padding: 5px 8px;
+      font-size: 14px;
+      line-height: 1.25;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .top-left .box-bordered {
+      border-bottom: 1px solid #000;
+    }
+    .top-left .lbl-tiny {
+      font-size: 12px;
+      color: #333;
+      display: block;
+      margin-bottom: 1px;
+    }
+    .top-left .logo-space {
+      flex-shrink: 0;
     }
     .top-right {
       width: 49%;
@@ -2399,7 +2464,7 @@
     .meta-tbl td {
       border-bottom: 1px solid #000;
       border-right: 1px solid #000;
-      padding: 1.5px 3.5px;
+      padding: 2.5px 4px;
       font-size: 11px;
       vertical-align: top;
       width: 50%;
@@ -2414,14 +2479,15 @@
     /* Items Table */
     .items-tbl {
       width: 100%;
+      height: 100%;
       border-collapse: collapse;
-      border-bottom: 1px solid #000;
+      table-layout: fixed;
     }
     .items-tbl th {
       border-bottom: 1px solid #000;
       border-right: 1px solid #000;
-      padding: 2px 2px;
-      font-size: 11.5px;
+      padding: 3px 2px;
+      font-size: 12px;
       font-weight: bold;
       text-align: center;
       background: #fff;
@@ -2431,21 +2497,38 @@
     }
     .items-tbl td {
       border-right: 1px solid #000;
-      padding: 1.5px 3px;
-      font-size: 11.5px;
+      border-bottom: none;
+      padding: 2.5px 4px;
+      font-size: 13.5px;
       vertical-align: top;
+    }
+    .items-tbl .item-row td {
+      font-weight: bold;
     }
     .items-tbl td:last-child {
       border-right: none;
     }
-    .items-tbl tfoot td {
-      border-top: 1px solid #000;
-      border-right: 1px solid #000;
-      padding: 2px 3px;
-      font-size: 12px;
-      font-weight: bold;
+    .items-tbl tbody tr.item-row,
+    .items-tbl tbody tr.tax-row {
+      height: 1px;
     }
-    .items-tbl tfoot td:last-child {
+    .items-tbl tbody tr.filler-row {
+      height: auto;
+    }
+    .items-tbl tbody tr.filler-row td {
+      border-bottom: none;
+      padding: 0;
+    }
+    .items-tbl tfoot tr.items-total-row td {
+      border-top: 1px solid #000;
+      border-bottom: 1px solid #000;
+      border-right: 1px solid #000;
+      padding: 3px 4px;
+      font-size: 13.5px;
+      font-weight: bold;
+      vertical-align: middle;
+    }
+    .items-tbl tfoot tr.items-total-row td:last-child {
       border-right: none;
     }
 
@@ -2457,6 +2540,7 @@
       display: flex;
       justify-content: space-between;
       align-items: baseline;
+      flex-shrink: 0;
     }
 
     /* HSN / Tax Breakdown Table */
@@ -2490,12 +2574,14 @@
       border-bottom: 1px solid #000;
       padding: 1.5px 4px;
       font-size: 10.5px;
+      flex-shrink: 0;
     }
 
     /* Bank Details & Signature Bottom */
     .bottom-section {
       display: flex;
       width: 100%;
+      flex-shrink: 0;
     }
     .bottom-left {
       width: 51%;
@@ -2522,23 +2608,24 @@
       text-align: center;
       font-size: 11px;
       padding: 2px 0 0;
-      page-break-before: avoid;
-      break-before: avoid;
+      flex-shrink: 0;
     }
 
     @page {
       size: A4 portrait;
-      margin: 4mm 6mm;
+      margin: 5mm 7mm;
     }
     @media print {
-      body {
+      html, body {
         background: #fff !important;
         margin: 0 !important;
         padding: 0 !important;
       }
       .print-wrapper {
         width: 100% !important;
+        height: 277mm !important;
         margin: 0 !important;
+        padding: 0 !important;
         box-shadow: none !important;
       }
       .sheet {
@@ -2554,32 +2641,35 @@
     <div class="sheet">
       <!-- TOP SECTION: SUPPLIER, PARTIES & METADATA -->
       <div class="top-section">
-        <!-- Left Column: Supplier & Consignee / Buyer -->
+        <!-- Left Column: Supplier & Buyer (Half-Half) -->
         <div class="top-left">
-          <!-- Supplier Block -->
-          <div class="box-block box-bordered">
-            <div style="font-size:13px;font-weight:bold;">${esc(s.businessName || 'ROYAL SANITATION')}</div>
-            ${s.address ? `<div>${esc(s.address)}</div>` : ''}
-            <div>GSTIN/UIN: <b>${esc(s.gstin || '23CHLPD7073A1ZQ')}</b></div>
-            <div>State Name : <b>${esc(s.state || 'Madhya Pradesh')}</b>, Code : <b>${esc(codeFor(s.state) || '23')}</b></div>
+          <!-- Supplier Block (Royal Sanitation) - Top Half -->
+          <div class="box-block box-bordered" style="display:flex;flex-direction:row;align-items:center;gap:12px;">
+            ${logoSrc ? `
+              <div class="logo-space" style="flex-shrink:0;display:flex;align-items:center;justify-content:center;">
+                <img src="${logoSrc}" alt="Logo" style="max-height:68px;max-width:85px;object-fit:contain;display:block;">
+              </div>
+            ` : `
+              <div class="logo-space" style="flex-shrink:0;width:68px;height:68px;border:1px dashed #777;border-radius:4px;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#fafafa;color:#555;font-size:9.5px;font-weight:700;text-align:center;padding:2px;line-height:1.2;">
+                <span>LOGO</span>
+                <span style="font-size:8px;color:#888;font-weight:normal;">SPACE</span>
+              </div>
+            `}
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;">
+              <div style="font-size:18px;font-weight:bold;line-height:1.2;text-transform:uppercase;letter-spacing:0.3px;">${esc(String(s.businessName || 'ROYAL SANITATION').toUpperCase())}</div>
+              ${(s.address || s.city) ? `<div style="font-size:14px;line-height:1.25;margin-top:2px;font-weight:bold;text-transform:capitalize;">${esc(titleCase([s.address, s.city].filter(Boolean).join(', ')))}</div>` : ''}
+              <div style="font-size:14px;line-height:1.25;margin-top:2px;">GSTIN/UIN: <b>${esc(s.gstin || '23CHLPD7073A1ZQ')}</b></div>
+              <div style="font-size:14px;line-height:1.25;">State Name : <b style="text-transform:capitalize;">${esc(titleCase(s.state || 'Madhya Pradesh'))}</b>, Code : <b>${esc(codeFor(s.state) || '23')}</b></div>
+            </div>
           </div>
 
-          <!-- Consignee (Ship to) Block -->
-          <div class="box-block box-bordered">
-            <span class="lbl-tiny">Consignee (Ship to)</span>
-            <div style="font-weight:bold;font-size:12px;">${esc(inv.partyName || '—')}</div>
-            <div>${esc(inv.address || '')}</div>
-            <div>GSTIN/UIN &nbsp; : <b>${esc(inv.gstin || '—')}</b></div>
-            <div>State Name : <b>${esc(inv.state || '—')}</b>, Code : <b>${esc(inv.stateCode || codeFor(inv.state) || '—')}</b></div>
-          </div>
-
-          <!-- Buyer (Bill to) Block -->
-          <div class="box-block" style="flex:1;">
+          <!-- Buyer (Bill to) Block - Bottom Half -->
+          <div class="box-block">
             <span class="lbl-tiny">Buyer (Bill to)</span>
-            <div style="font-weight:bold;font-size:12px;">${esc(inv.partyName || '—')}</div>
-            <div>${esc(inv.address || '')}</div>
-            <div>GSTIN/UIN &nbsp; : <b>${esc(inv.gstin || '—')}</b></div>
-            <div>State Name : <b>${esc(inv.state || '—')}</b>, Code : <b>${esc(inv.stateCode || codeFor(inv.state) || '—')}</b></div>
+            <div style="font-weight:bold;font-size:17px;line-height:1.2;margin-bottom:2px;text-transform:capitalize;">${esc(titleCase(inv.partyName || '—'))}</div>
+            ${(inv.address || inv.city) ? `<div style="font-size:14px;line-height:1.25;font-weight:bold;text-transform:capitalize;">${esc(titleCase(inv.address || inv.city))}</div>` : ''}
+            <div style="font-size:14px;line-height:1.25;">GSTIN/UIN &nbsp; : <b>${esc(inv.gstin || '—')}</b></div>
+            <div style="font-size:14px;line-height:1.25;">State Name : <b style="text-transform:capitalize;">${esc(titleCase(inv.state || '—'))}</b>, Code : <b>${esc(inv.stateCode || codeFor(inv.state) || '—')}</b></div>
           </div>
         </div>
 
@@ -2643,7 +2733,7 @@
               </td>
               <td>
                 <span class="lbl-tiny">Destination</span>
-                <b>${esc(placeOfSupply)}</b>
+                <b style="text-transform:capitalize;">${esc(titleCase(placeOfSupply))}</b>
               </td>
             </tr>
           </table>
@@ -2651,7 +2741,7 @@
       </div>
 
       <!-- LINE ITEMS TABLE -->
-      <div style="width:100%;">
+      <div class="items-section-wrap">
         <table class="items-tbl">
         <thead>
           <tr>
@@ -2669,22 +2759,22 @@
           ${items.map((it, idx) => {
             const rateIncl = round2(num(it.rate) * (1 + num(it.gstRate) / 100));
             return `
-              <tr>
+              <tr class="item-row">
                 <td style="text-align:center;">${idx + 1}</td>
-                <td><b>${esc(it.description)}</b></td>
+                <td style="text-transform:capitalize;"><b>${esc(titleCase(it.description))}</b></td>
                 <td style="text-align:center;">${esc(it.hsn || '—')}</td>
-                <td style="text-align:right;"><b>${num(it.qty).toFixed(2)} ${esc(it.unit || 'pcs')}</b></td>
+                <td style="text-align:right;">${num(it.qty).toFixed(2)} ${esc(titleCase(it.unit || 'pcs'))}</td>
                 <td style="text-align:right;">${moneyRaw(rateIncl)}</td>
                 <td style="text-align:right;">${moneyRaw(it.rate)}</td>
-                <td style="text-align:center;">${esc(it.unit || 'pcs')}</td>
-                <td style="text-align:right;"><b>${moneyRaw(it.taxable)}</b></td>
+                <td style="text-align:center;text-transform:capitalize;">${esc(titleCase(it.unit || 'pcs'))}</td>
+                <td style="text-align:right;">${moneyRaw(it.taxable)}</td>
               </tr>
             `;
           }).join('')}
 
           <!-- TAX ROWS (IGST or CGST/SGST) -->
           ${!isIntra ? `
-            <tr>
+            <tr class="tax-row">
               <td></td>
               <td style="text-align:right;font-style:italic;font-weight:bold;padding-right:16px;">IGST</td>
               <td></td>
@@ -2695,7 +2785,7 @@
               <td style="text-align:right;font-weight:bold;">${moneyRaw(inv.totalGst)}</td>
             </tr>
           ` : `
-            <tr>
+            <tr class="tax-row">
               <td></td>
               <td style="text-align:right;font-style:italic;font-weight:bold;padding-right:16px;">CGST</td>
               <td></td>
@@ -2705,7 +2795,7 @@
               <td></td>
               <td style="text-align:right;font-weight:bold;">${moneyRaw(inv.cgst)}</td>
             </tr>
-            <tr>
+            <tr class="tax-row">
               <td></td>
               <td style="text-align:right;font-style:italic;font-weight:bold;padding-right:16px;">SGST</td>
               <td></td>
@@ -2718,7 +2808,7 @@
           `}
 
           ${num(inv.roundOff) !== 0 ? `
-            <tr>
+            <tr class="tax-row">
               <td></td>
               <td style="text-align:right;font-style:italic;padding-right:16px;">Round Off</td>
               <td></td>
@@ -2730,20 +2820,21 @@
             </tr>
           ` : ''}
 
-          <!-- FILLER ROW TO STRETCH VERTICAL GRID ELEGANTLY -->
-          <tr style="height:${fillerHeight}px;">
+          <!-- Empty filler row to extend vertical column lines all the way to Total row -->
+          <tr class="filler-row">
             <td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>
           </tr>
         </tbody>
-
         <tfoot>
-          <tr>
-            <td colspan="3" style="text-align:right;">Total</td>
-            <td style="text-align:right;"><b>${totalQty.toFixed(2)} ${esc(items[0]?.unit || 'pcs')}</b></td>
+          <tr class="items-total-row">
+            <td></td>
+            <td style="text-align:right;font-weight:bold;">Total</td>
+            <td></td>
+            <td style="text-align:right;font-weight:bold;">${totalQty.toFixed(2)} ${esc(items[0]?.unit || 'pcs')}</td>
             <td></td>
             <td></td>
             <td></td>
-            <td style="text-align:right;font-size:12.5px;"><b>₹ ${moneyRaw(inv.grandTotal)}</b></td>
+            <td style="text-align:right;font-size:15px;font-weight:bold;">₹ ${moneyRaw(inv.grandTotal)}</td>
           </tr>
         </tfoot>
       </table>
@@ -2759,7 +2850,7 @@
       </div>
 
       <!-- HSN/SAC TAX BREAKDOWN TABLE & WORDS -->
-      <div style="width:100%;">
+      <div style="width:100%;flex-shrink:0;">
         ${!isIntra ? `
           <table class="tax-tbl">
             <thead>
@@ -2849,12 +2940,13 @@
       <div class="bottom-section">
         <!-- Left: Bank Details & Declaration -->
         <div class="bottom-left">
-          <div class="box-block">
+          <div class="box-block" style="text-transform:uppercase;">
             <b>Company's Bank Details</b><br>
-            <table style="font-size:10px;margin-top:1px;line-height:1.2;">
-              <tr><td style="padding:0.5px 0;width:85px;">Bank Name</td><td>: <b>${esc(bankName)}</b></td></tr>
+            <table style="font-size:10px;margin-top:1px;line-height:1.25;text-transform:uppercase;">
+              <tr><td style="padding:0.5px 0;width:78px;">Bank Name</td><td>: <b>${esc(bankName)}</b></td></tr>
               <tr><td style="padding:0.5px 0;">A/c No.</td><td>: <b>${esc(acNo)}</b></td></tr>
-              <tr><td style="padding:0.5px 0;">Branch &amp; IFS Code</td><td>: <b>${esc(branchIfsc)}</b></td></tr>
+              <tr><td style="padding:0.5px 0;">Branch</td><td>: <b>${esc(branchName)}</b></td></tr>
+              <tr><td style="padding:0.5px 0;">Ifsc Code</td><td>: <b>${esc(ifscCode)}</b></td></tr>
             </table>
           </div>
 
@@ -2886,8 +2978,17 @@
     <div class="computer-footer">This is a Computer Generated Invoice</div>
   </div>
 
+
+
 </body>
 </html>`;
+      return printHtml;
+    }
+
+    /** Open print-ready formatted GST Tax Invoice matching user's exact Tally layout */
+    function printInvoice(inv, isPreviewOnly = false) {
+      const fileName = getInvoiceFileName(inv);
+      const printHtml = generateInvoiceHtml(inv, fileName);
 
       // If user clicked Preview / View, open in a new tab so they can review the invoice
       if (isPreviewOnly) {
@@ -2902,7 +3003,11 @@
         return;
       }
 
-      // If user clicked Print, open print dialogue directly without opening a new tab
+      // Temporarily update document.title of main window and iframe so Chrome/Edge
+      // automatically suggests "INV - [No] - [Party], [City].pdf" in the Save as PDF dialog
+      const originalTitle = document.title;
+      document.title = fileName;
+
       const existingFrame = document.getElementById('__print_iframe__');
       if (existingFrame) existingFrame.remove();
 
@@ -2911,19 +3016,90 @@
       iframe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;border:0;opacity:0;pointer-events:none;';
       document.body.appendChild(iframe);
 
-      iframe.contentDocument.open();
-      iframe.contentDocument.write(printHtml);
-      iframe.contentDocument.close();
+      const doc = iframe.contentDocument || iframe.contentWindow.document;
+      doc.open();
+      doc.write(printHtml);
+      doc.close();
+      if (doc) doc.title = fileName;
 
-      // Wait for iframe content (fonts, layout) to load, then trigger print dialog directly
-      iframe.onload = () => {
-        setTimeout(() => {
-          iframe.contentWindow.focus();
-          iframe.contentWindow.print();
-          // Clean up iframe after print dialog closes
-          setTimeout(() => { iframe.remove(); }, 1000);
-        }, 300);
+      const restore = () => {
+        document.title = originalTitle;
+        try { iframe.remove(); } catch (e) {}
+        window.removeEventListener('afterprint', restore);
       };
+      window.addEventListener('afterprint', restore);
+
+      // Give browser time to parse fonts/CSS, then invoke native print dialog
+      setTimeout(() => {
+        iframe.contentWindow.focus();
+        iframe.contentWindow.print();
+        // Fallback cleanup after print dialog is closed
+        setTimeout(restore, 2500);
+      }, 350);
+    }
+
+    /** Download invoice directly as PDF to the user's system without opening print dialog */
+    async function downloadInvoice(inv) {
+      const fileName = getInvoiceFileName(inv);
+      const printHtml = generateInvoiceHtml(inv, fileName);
+
+      if (window.html2pdf) {
+        notify(`Downloading PDF: ${fileName}.pdf`);
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'position:fixed;left:0;top:0;width:196mm;height:284mm;background:#fff;z-index:-9999;opacity:0.01;pointer-events:none;overflow:hidden;';
+        wrap.innerHTML = printHtml;
+        document.body.appendChild(wrap);
+
+        // Ensure full invoice (Tax Invoice header, stretched sheet, and computer footer) is targeted
+        const targetEl = wrap.querySelector('.print-wrapper') || wrap;
+        targetEl.style.width = '196mm';
+        targetEl.style.height = '284mm';
+        targetEl.style.margin = '0';
+        targetEl.style.boxShadow = 'none';
+
+        const sheetEl = wrap.querySelector('.sheet');
+        if (sheetEl) sheetEl.style.boxShadow = 'none';
+
+        const opt = {
+          margin: [5, 7, 5, 7], // 5mm top/bottom, 7mm left/right -> exact A4 margins (196mm x 284mm content fits 210mm x 297mm page)
+          filename: `${fileName}.pdf`,
+          image: { type: 'jpeg', quality: 0.98 },
+          html2canvas: {
+            scale: 2,
+            useCORS: true,
+            logging: false,
+            scrollX: 0,
+            scrollY: 0
+          },
+          jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+        };
+
+        try {
+          await html2pdf().set(opt).from(targetEl).save();
+          notify(`Downloaded: ${fileName}.pdf`);
+        } catch (err) {
+          console.warn('html2pdf conversion failed, saving HTML document:', err);
+          downloadFileBlob(printHtml, `${fileName}.html`, 'text/html;charset=utf-8');
+        } finally {
+          wrap.remove();
+        }
+      } else {
+        downloadFileBlob(printHtml, `${fileName}.html`, 'text/html;charset=utf-8');
+      }
+    }
+
+    /** Direct file download helper using Blob and temporary anchor */
+    function downloadFileBlob(content, filename, mimeType) {
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      notify(`Downloaded: ${filename}`);
     }
 
     /** Send invoice summary via WhatsApp Web */
@@ -3158,6 +3334,10 @@
 
         case 'view':
           if (inv) printInvoice(inv, true); // Preview mode without immediate print prompt
+          break;
+
+        case 'download':
+          if (inv) downloadInvoice(inv);
           break;
 
         case 'print':
@@ -3490,6 +3670,36 @@
             }
           }
 
+          // Auto-save or update products in the catalogue from invoice line items
+          invData.items.forEach(it => {
+            if (!it.description || !it.description.trim()) return;
+            const itemName = it.description.trim();
+            const existingProdIdx = db.products.findIndex(p => p.name.toLowerCase() === itemName.toLowerCase());
+            if (existingProdIdx >= 0) {
+              // Update existing product with latest details
+              db.products[existingProdIdx] = {
+                ...db.products[existingProdIdx],
+                hsn: it.hsn || db.products[existingProdIdx].hsn || '',
+                unit: it.unit || db.products[existingProdIdx].unit || 'pcs',
+                rate: num(it.rate) || db.products[existingProdIdx].rate || 0,
+                gstRate: num(it.gstRate) !== undefined ? num(it.gstRate) : db.products[existingProdIdx].gstRate,
+                updatedAt: now
+              };
+            } else {
+              // Save as new product
+              db.products.push({
+                id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()),
+                name: itemName,
+                hsn: it.hsn || '',
+                unit: it.unit || 'pcs',
+                rate: num(it.rate) || 0,
+                gstRate: num(it.gstRate) ?? 18,
+                description: '',
+                updatedAt: now
+              });
+            }
+          });
+
           if (!saveDB()) return;
 
           notify(existing ? 'Invoice updated successfully.' : 'Invoice created successfully.');
@@ -3661,6 +3871,47 @@
 
       renderItems();
       document.getElementById('invoice-form').dataset.dirty = '1';
+    });
+
+    // Auto title-case text fields in invoice form on blur / Enter key
+    document.addEventListener('focusout', e => {
+      if (currentPage !== 'create') return;
+      const el = e.target;
+      if (!el.matches('#invoice-form input[type="text"], #invoice-form input:not([type]), #invoice-form input[type="search"]')) return;
+
+      // Skip fields that should NOT be title-cased
+      const skipIds = ['party-gstin', 'party-phone', 'party-email', 'inv-number'];
+      const skipKeys = ['hsn', 'gstin', 'phone', 'email'];
+      if (skipIds.includes(el.id)) return;
+      if (el.dataset.k && skipKeys.includes(el.dataset.k)) return;
+
+      const raw = el.value;
+      if (!raw.trim()) return;
+      const cased = titleCase(raw);
+      if (cased !== raw) {
+        el.value = cased;
+        // Sync the value back to invoiceDraft if it's a keyed item field
+        if (el.dataset.k) {
+          const tr = el.closest('tr[data-item]');
+          if (tr !== null) {
+            const idx = Number(tr.dataset.item);
+            if (invoiceDraft.items[idx]) {
+              invoiceDraft.items[idx][el.dataset.k] = cased;
+            }
+          }
+        }
+      }
+    });
+
+    // Also trigger on Enter key inside invoice form text inputs
+    document.addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      if (currentPage !== 'create') return;
+      const el = e.target;
+      if (!el.matches('#invoice-form input[type="text"], #invoice-form input:not([type]), #invoice-form input[type="search"]')) return;
+      // Let focusout handle it naturally when focus moves
+      el.blur();
+      el.focus();
     });
 
     // Initialize application
