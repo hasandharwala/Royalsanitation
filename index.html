@@ -837,7 +837,7 @@
         position: static;
         padding: 0 14px;
       }
-      .topright span { display: none; }
+      .topright span:not(#sync-badge) { display: none; }
       .content { padding: 16px 12px; }
       .pagehead h2 { font-size: 20px; }
       .cards { gap: 10px; }
@@ -909,6 +909,7 @@
       <header class="topbar">
         <div class="crumb" id="crumb">Dashboard</div>
         <div class="topright">
+          <span id="sync-badge" style="padding:3px 9px;border-radius:99px;font-size:11px;font-weight:700;background:var(--line-subtle);color:var(--muted);">⟳ Connecting…</span>
           <span id="today"></span>
           <button class="secondary small" id="sign-out" type="button" title="Sign out">Sign Out</button>
           <div class="avatar" title="Royal Sanitation">RS</div>
@@ -970,6 +971,9 @@
     let _firebaseInitPromise = null;
     let _cloudQueue = Promise.resolve();
     let _dbRevision = 0;
+    let _savesInFlight = 0;
+    let _unsubscribeLive = null;
+    const PENDING_KEY = 'royalSanitationInvoiceApp_v1_pending';
 
     function loadScriptOnce(src, marker) {
       if (marker && document.querySelector(`script[data-app-sdk="${marker}"]`)) {
@@ -1063,8 +1067,25 @@
       invoices: [],
       parties: [],
       products: [],
+      // Tombstones: IDs of records deleted on any device, so a stale device can't resurrect them during sync.
+      deleted: { invoices: [], parties: [], products: [] },
       seq: 329
     };
+
+    function normalizeDeleted(d) {
+      const out = { invoices: [], parties: [], products: [] };
+      ['invoices', 'parties', 'products'].forEach(k => {
+        out[k] = Array.isArray(d && d[k]) ? d[k].map(String) : [];
+      });
+      return out;
+    }
+
+    function markDeleted(kind, id) {
+      if (!id) return;
+      if (!db.deleted) db.deleted = normalizeDeleted();
+      if (!db.deleted[kind]) db.deleted[kind] = [];
+      if (!db.deleted[kind].includes(String(id))) db.deleted[kind].push(String(id));
+    }
 
     /* ==========================================================================
        SECTION 2: APPLICATION STATE & PERSISTENCE
@@ -1089,6 +1110,7 @@
             ...DEFAULTS.settings,
             ...(data.settings || {})
           },
+          deleted: normalizeDeleted(data.deleted),
           seq: data.seq || data.settings?.nextNumber || 329
         };
       } catch (err) {
@@ -1108,18 +1130,81 @@
       }
 
       _setSyncBadge('saving');
+      _savesInFlight += 1;
+      try { localStorage.setItem(PENDING_KEY, '1'); } catch (e) {}
       queueCloudOperation(async () => {
         await initFirebase();
         if (!_auth || !_auth.currentUser) throw new Error('Sign in is required before cloud data can be saved.');
         // Snapshot at execution time, not enqueue time, so earlier sync merges are not overwritten by stale snapshots.
-        const snapshot = JSON.parse(JSON.stringify(db));
+        const snapshot = cloudPayload();
+        const sentDeleted = normalizeDeleted(db.deleted);
         await _cloudDoc.set(snapshot);
-        _setSyncBadge('synced');
+        // Deleted records are now truly gone from the database; drop the delete markers we just synced.
+        ['invoices', 'parties', 'products'].forEach(k => {
+          const sent = new Set(sentDeleted[k]);
+          db.deleted[k] = (db.deleted[k] || []).filter(id => !sent.has(String(id)));
+        });
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); } catch (e) {}
+      }).then(() => {
+        _savesInFlight = Math.max(0, _savesInFlight - 1);
+        if (_savesInFlight === 0) {
+          try { localStorage.removeItem(PENDING_KEY); } catch (e) {}
+          _setSyncBadge('synced');
+        }
       }).catch(err => {
+        _savesInFlight = Math.max(0, _savesInFlight - 1);
         console.error('Cloud save failed:', err);
         _setSyncBadge('offline');
+        notify('Could not save to the cloud. Check your internet connection and try again.');
       });
       return true;
+    }
+
+    /** What gets stored in the cloud: all live data, with no delete markers, so deleted records leave no trace. */
+    function cloudPayload() {
+      const copy = JSON.parse(JSON.stringify(db));
+      copy.deleted = { invoices: [], parties: [], products: [] };
+      return copy;
+    }
+
+    /** Replace local data with the cloud copy (the cloud is the source of truth). */
+    function applyCloudData(c) {
+      db = {
+        ...structuredClone(DEFAULTS),
+        ...c,
+        settings: { ...DEFAULTS.settings, ...(c.settings || {}) },
+        invoices: Array.isArray(c.invoices) ? c.invoices : [],
+        parties: Array.isArray(c.parties) ? c.parties : [],
+        products: Array.isArray(c.products) ? c.products : [],
+        deleted: normalizeDeleted(),
+        seq: Number(c.seq || c.settings?.nextNumber || DEFAULTS.seq)
+      };
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); } catch (e) {}
+    }
+
+    function hasPendingLocalChanges() {
+      try { return localStorage.getItem(PENDING_KEY) === '1'; } catch (e) { return false; }
+    }
+
+    /** Live listener: a change made on any device shows up on all other devices immediately. */
+    function startLiveSync() {
+      if (_unsubscribeLive || !_cloudDoc) return;
+      _unsubscribeLive = _cloudDoc.onSnapshot(snap => {
+        if (!snap.exists || snap.metadata.hasPendingWrites || _savesInFlight > 0 || hasPendingLocalChanges()) return;
+        applyCloudData(snap.data() || {});
+        _setSyncBadge('synced');
+        const formDirty = currentPage === 'create' && document.getElementById('invoice-form')?.dataset.dirty === '1';
+        const editorOpen = ['party-editor', 'product-editor'].some(id => (document.getElementById(id)?.innerHTML || '').trim());
+        if (formDirty || editorOpen) notify('Data was updated from another device.');
+        else render();
+      }, err => {
+        console.error('Live sync error:', err);
+        _setSyncBadge('offline');
+      });
+    }
+
+    function stopLiveSync() {
+      if (_unsubscribeLive) { _unsubscribeLive(); _unsubscribeLive = null; }
     }
 
     /** Update the cloud sync status badge */
@@ -1146,11 +1231,16 @@
     }
 
     /** Merge record arrays by ID. Cloud wins on conflicts unless local data changed during startup sync. */
-    function mergeRecords(cloudRecords, localRecords, localWins) {
+    function mergeRecords(cloudRecords, localRecords, localWins, deletedIds = []) {
       const result = new Map();
+      const gone = new Set((deletedIds || []).map(String));
       const keyFor = (item, index, source) => String(item && item.id ? item.id : `${source}-${index}-${item && (item.number || item.name || item.description) || ''}`);
-      (Array.isArray(cloudRecords) ? cloudRecords : []).forEach((item, i) => result.set(keyFor(item, i, 'cloud'), item));
+      (Array.isArray(cloudRecords) ? cloudRecords : []).forEach((item, i) => {
+        if (item && item.id && gone.has(String(item.id))) return;
+        result.set(keyFor(item, i, 'cloud'), item);
+      });
       (Array.isArray(localRecords) ? localRecords : []).forEach((item, i) => {
+        if (item && item.id && gone.has(String(item.id))) return;
         const key = keyFor(item, i, 'local');
         if (localWins || !result.has(key)) result.set(key, item);
       });
@@ -1167,16 +1257,35 @@
           if (!_auth || !_auth.currentUser) throw new Error('Sign in is required before cloud data can be loaded.');
           const snap = await _cloudDoc.get();
           if (!snap.exists) {
-            await _cloudDoc.set(JSON.parse(JSON.stringify(db)));
+            await _cloudDoc.set(cloudPayload());
             _setSyncBadge('synced');
             return;
           }
 
           const cloudData = snap.data() || {};
+          // Normal case: this device has no unsent changes, so the cloud copy is the truth.
+          // This removes anything deleted elsewhere and never creates duplicates.
+          if (!hasPendingLocalChanges() && _dbRevision === revisionAtStart) {
+            applyCloudData(cloudData);
+            // One-time cleanup of old delete markers still stored in the cloud document.
+            const old = normalizeDeleted(cloudData.deleted);
+            if (old.invoices.length || old.parties.length || old.products.length) {
+              await _cloudDoc.set(cloudPayload());
+            }
+            _setSyncBadge('synced');
+            render();
+            return;
+          }
           const localWins = _dbRevision !== revisionAtStart;
           const localData = db;
           const cloudSeq = Number(cloudData.seq || cloudData.settings?.nextNumber || DEFAULTS.seq);
           const localSeq = Number(localData.seq || localData.settings?.nextNumber || DEFAULTS.seq);
+          const cloudDel = normalizeDeleted(cloudData.deleted);
+          const localDel = normalizeDeleted(localData.deleted);
+          const unionDel = {};
+          ['invoices', 'parties', 'products'].forEach(k => {
+            unionDel[k] = Array.from(new Set([...cloudDel[k], ...localDel[k]]));
+          });
           db = {
             ...structuredClone(DEFAULTS),
             ...cloudData,
@@ -1185,21 +1294,28 @@
               ...(cloudData.settings || {}),
               ...(localWins ? (localData.settings || {}) : {})
             },
-            invoices: mergeRecords(cloudData.invoices, localData.invoices, localWins),
-            parties: mergeRecords(cloudData.parties, localData.parties, localWins),
-            products: mergeRecords(cloudData.products, localData.products, localWins),
+            invoices: mergeRecords(cloudData.invoices, localData.invoices, localWins, unionDel.invoices),
+            parties: mergeRecords(cloudData.parties, localData.parties, localWins, unionDel.parties),
+            products: mergeRecords(cloudData.products, localData.products, localWins, unionDel.products),
+            deleted: unionDel,
             seq: Math.max(cloudSeq, localSeq)
           };
           localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
-          const hasLocalOnly = (localRecords, cloudRecords) => {
+          const hasLocalOnly = (localRecords, cloudRecords, kind) => {
             const cloudIds = new Set((Array.isArray(cloudRecords) ? cloudRecords : []).map(x => String(x && x.id || '')));
-            return (Array.isArray(localRecords) ? localRecords : []).some(x => x && x.id && !cloudIds.has(String(x.id)));
+            const gone = new Set(unionDel[kind]);
+            return (Array.isArray(localRecords) ? localRecords : []).some(x => x && x.id && !cloudIds.has(String(x.id)) && !gone.has(String(x.id)));
           };
-          const needsCloudWrite = localWins ||
-            hasLocalOnly(localData.invoices, cloudData.invoices) ||
-            hasLocalOnly(localData.parties, cloudData.parties) ||
-            hasLocalOnly(localData.products, cloudData.products) || localSeq > cloudSeq;
-          if (needsCloudWrite) await _cloudDoc.set(JSON.parse(JSON.stringify(db)));
+          const tombstonesChanged = ['invoices', 'parties', 'products'].some(k => unionDel[k].length !== cloudDel[k].length);
+          const needsCloudWrite = localWins || tombstonesChanged ||
+            hasLocalOnly(localData.invoices, cloudData.invoices, 'invoices') ||
+            hasLocalOnly(localData.parties, cloudData.parties, 'parties') ||
+            hasLocalOnly(localData.products, cloudData.products, 'products') || localSeq > cloudSeq;
+          if (needsCloudWrite) {
+            await _cloudDoc.set(cloudPayload());
+            db.deleted = normalizeDeleted();
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); } catch (e) {}
+          }
           _setSyncBadge('synced');
           render();
         });
@@ -1207,6 +1323,7 @@
         console.error('Cloud sync error:', err);
         _setSyncBadge('offline');
       }
+      startLiveSync();
     }
 
     /* ==========================================================================
@@ -3682,7 +3799,17 @@
       const inv = db.invoices.find(i => i.id === id);
       if (!inv) return;
 
-      if (inv.status === 'Issued') {
+      if (inv.status === 'Cancelled') {
+        const confirmed = await confirmBox(
+          'Permanently Delete Invoice?',
+          `Invoice ${inv.number} is already cancelled. Deleting it removes it permanently from the database on all devices. This cannot be undone.`,
+          'Delete Permanently'
+        );
+        if (!confirmed) return;
+
+        db.invoices = db.invoices.filter(i => i.id !== id);
+        markDeleted('invoices', id);
+      } else if (inv.status === 'Issued') {
         const confirmed = await confirmBox(
           'Cancel Issued Invoice?',
           `Invoice ${inv.number} has been legally issued. It will be marked as "Cancelled" to preserve accounting records rather than erased.`,
@@ -3701,6 +3828,7 @@
         if (!confirmed) return;
 
         db.invoices = db.invoices.filter(i => i.id !== id);
+        markDeleted('invoices', id);
       }
 
       saveDB();
@@ -3713,15 +3841,12 @@
       const p = db.parties.find(x => x.id === id);
       if (!p) return;
 
-      if (db.invoices.some(i => i.partyId === id || i.partyName.toLowerCase() === p.name.toLowerCase())) {
-        notify('This customer is linked to existing invoices. Keep it to preserve invoice records.');
-        return;
-      }
-
-      const ok = await confirmBox('Delete Customer?', `Remove "${p.name}" from your saved customers?`, 'Delete');
+      const linked = db.invoices.some(i => i.partyId === id || String(i.partyName || '').toLowerCase() === String(p.name || '').toLowerCase());
+      const ok = await confirmBox('Delete Customer?', `Remove "${p.name}" from your saved customers everywhere (all devices)?` + (linked ? ' Existing invoices keep their own copy of the customer details.' : ''), 'Delete');
       if (!ok) return;
 
       db.parties = db.parties.filter(x => x.id !== id);
+      markDeleted('parties', id);
       saveDB();
       render();
       notify('Customer deleted.');
@@ -3736,6 +3861,7 @@
       if (!ok) return;
 
       db.products = db.products.filter(x => x.id !== id);
+      markDeleted('products', id);
       saveDB();
       render();
       notify('Item deleted from catalogue.');
@@ -3750,10 +3876,11 @@
       );
       if (!ok) return;
 
+      const oldDb = db;
       localStorage.removeItem(STORAGE_KEY);
       db = structuredClone(DEFAULTS);
-      // Also clear from Firestore
-      try { await _cloudDoc.delete(); } catch(e) {}
+      // Tombstone everything so other devices don't restore it on their next sync
+      ['invoices', 'parties', 'products'].forEach(k => (oldDb[k] || []).forEach(r => markDeleted(k, r && r.id)));
       saveDB();
       notify('All data cleared (local + cloud).');
       setPage('dashboard');
@@ -3884,7 +4011,7 @@
           const existing = editingId ? db.invoices.find(i => i.id === editingId) : null;
           const now = new Date().toISOString();
 
-          invData.id = editingId || crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+          invData.id = editingId || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
           invData.createdAt = existing?.createdAt || now;
           invData.updatedAt = now;
 
@@ -4029,7 +4156,7 @@
             const ok = await confirmBox('Import Backup', 'This will overwrite your existing local data with the backup file.', 'Replace Data');
             if (!ok) return;
 
-            db = imported;
+            db = { ...structuredClone(DEFAULTS), ...imported, deleted: normalizeDeleted(imported.deleted) };
             saveDB();
             notify('Backup imported successfully.');
             render();
@@ -4196,6 +4323,7 @@
           render();
           syncFromCloud();
         } else {
+          stopLiveSync();
           document.body.classList.remove('authenticated');
           authGate.style.display = 'grid';
           _setSyncBadge('connecting');
