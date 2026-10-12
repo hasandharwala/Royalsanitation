@@ -3334,84 +3334,497 @@
       }, 350);
     }
 
-    /** Load the PDF renderer on demand. Try a local copy first, then a versioned CDN fallback. */
+    /** Load jsPDF on demand (used to write a real text PDF, not a picture). */
     async function loadHtml2Pdf() {
-      if (typeof window.html2pdf === 'function') return true;
+      const ready = () => window.jspdf && typeof window.jspdf.jsPDF === 'function';
+      if (ready()) return true;
       try {
-        await loadScriptOnce('html2pdf.bundle.min.js', 'html2pdf-local');
-        if (typeof window.html2pdf === 'function') return true;
-      } catch (err) {
-        console.warn('Local PDF library is unavailable; trying CDN fallback.', err);
-      }
-      try {
-        await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js', 'html2pdf-cdn');
-        return typeof window.html2pdf === 'function';
+        await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js', 'jspdf-cdn');
+        return ready();
       } catch (err) {
         console.warn('PDF library could not be loaded.', err);
         return false;
       }
     }
 
-    /** Render the complete invoice document in an isolated frame before converting it to PDF. */
+    /** Inter font files (they include the rupee sign). Cached after the first download. */
+    let _pdfFontCache = null;
+    async function loadPdfFonts() {
+      if (_pdfFontCache) return _pdfFontCache;
+      const toB64 = buf => {
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        return btoa(bin);
+      };
+      try {
+        const base = 'https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter@0.2.3/';
+        const [r, b] = await Promise.all([
+          fetch(base + 'Inter_400Regular.ttf').then(x => { if (!x.ok) throw new Error('font'); return x.arrayBuffer(); }),
+          fetch(base + 'Inter_700Bold.ttf').then(x => { if (!x.ok) throw new Error('font'); return x.arrayBuffer(); })
+        ]);
+        _pdfFontCache = { fontRegularB64: toB64(r), fontBoldB64: toB64(b) };
+      } catch (err) {
+        console.warn('Invoice font unavailable; using the built-in PDF font.', err);
+        return {};
+      }
+      return _pdfFontCache;
+    }
+
+    /** Turn the saved logo into a PNG data URL that jsPDF can embed. */
+    function prepareLogoForPdf(src) {
+      return new Promise(resolve => {
+        const safe = safeImageSrc(src);
+        if (!safe) return resolve({});
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const c = document.createElement('canvas');
+            c.width = img.naturalWidth || 1; c.height = img.naturalHeight || 1;
+            c.getContext('2d').drawImage(img, 0, 0);
+            resolve({ logoDataUrl: c.toDataURL('image/png'), logoW: c.width, logoH: c.height });
+          } catch (e) { resolve({}); }
+        };
+        img.onerror = () => resolve({});
+        img.src = safe;
+      });
+    }
+
+    /* Draws the GST tax invoice as a real text PDF (selectable / copyable text) with jsPDF. */
+    async function buildInvoiceTextPdf(inv, s, H) {
+      const { jsPDF, num, round2, moneyRaw, titleCase, fmtTallyDate, codeFor, numberWordsINR } = H;
+      const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+
+      // ---- fonts: Inter when available (has the rupee sign), otherwise built-in Helvetica ----
+      let FONT = 'helvetica';
+      let RS = 'Rs. ';
+      if (H.fontRegularB64 && H.fontBoldB64) {
+        try {
+          doc.addFileToVFS('Inter-Regular.ttf', H.fontRegularB64);
+          doc.addFont('Inter-Regular.ttf', 'Inter', 'normal', 400, 'Identity-H');
+          doc.addFileToVFS('Inter-Bold.ttf', H.fontBoldB64);
+          doc.addFont('Inter-Bold.ttf', 'InterBold', 'normal', 400, 'Identity-H');
+          FONT = 'Inter';
+          RS = '₹';
+        } catch (e) { FONT = 'helvetica'; RS = 'Rs. '; }
+      }
+
+      const LW = 0.22; // line width in mm
+      doc.setLineWidth(LW);
+      doc.setDrawColor(0);
+      doc.setTextColor(0);
+
+      const font = (bold, size) => {
+        if (FONT === 'Inter') doc.setFont(bold ? 'InterBold' : 'Inter', 'normal'); else doc.setFont('helvetica', bold ? 'bold' : 'normal');
+        doc.setFontSize(size);
+      };
+      const text = (str, x, y, o = {}) => doc.text(String(str ?? ''), x, y, o);
+      const ln = (x1, y1, x2, y2) => doc.line(x1, y1, x2, y2);
+      const wrap = (str, w) => doc.splitTextToSize(String(str ?? ''), w);
+
+      // ---- geometry (mm) ----
+      const X0 = 7, W = 196, X1 = X0 + W;
+      const SHEET_TOP = 13, SHEET_BOTTOM = 288;
+      const TOP_H = 52;            // supplier/buyer + meta block
+      const HEAD_H = 9;            // items table header
+      const TOTAL_H = 5.5;         // items "Total" row
+      const TAX_ROW_H = 4.2;
+      const WORDS_H = 10;
+      const BOTTOM_H = 45;
+      const TAXWORDS_H = 6;
+
+      const placeOfSupply = inv.state || inv.placeOfSupply || 'Maharashtra';
+      const isIntra = placeOfSupply === 'Madhya Pradesh';
+      const items = inv.items || [];
+
+      // ---- items table columns ----
+      const colW = [8, 78, 18, 22, 20, 17, 9, 24];
+      const colX = [X0];
+      colW.forEach((w, i) => colX.push(colX[i] + w));
+      const DESC_W = colW[1] - 3;
+
+      // ---- build row list ----
+      const rows = [];
+      items.forEach((it, idx) => {
+        const lines = wrap(titleCase(it.description), DESC_W);
+        rows.push({ kind: 'item', it, idx, lines, h: Math.max(4.8, lines.length * 3.6 + 1.4) });
+      });
+      const gstRate = num((items[0] && items[0].gstRate) || 18);
+      if (!isIntra) {
+        rows.push({ kind: 'tax', label: 'IGST', rate: gstRate + ' %', amt: moneyRaw(inv.totalGst), h: TAX_ROW_H });
+      } else {
+        rows.push({ kind: 'tax', label: 'CGST', rate: (gstRate / 2) + ' %', amt: moneyRaw(inv.cgst), h: TAX_ROW_H });
+        rows.push({ kind: 'tax', label: 'SGST', rate: (gstRate / 2) + ' %', amt: moneyRaw(inv.sgst), h: TAX_ROW_H });
+      }
+      if (num(inv.roundOff) !== 0) {
+        rows.push({ kind: 'tax', label: 'Round Off', rate: '', amt: (inv.roundOff >= 0 ? '+' : '') + moneyRaw(inv.roundOff), h: TAX_ROW_H });
+      }
+
+      // ---- HSN grouping ----
+      const hsnMap = {};
+      items.forEach(it => {
+        const code = it.hsn || '—';
+        if (!hsnMap[code]) hsnMap[code] = { hsn: code, taxable: 0, gstRate: num(it.gstRate), cgst: 0, sgst: 0, igst: 0, totalTax: 0 };
+        hsnMap[code].taxable += num(it.taxable);
+        hsnMap[code].cgst += num(it.cgst);
+        hsnMap[code].sgst += num(it.sgst);
+        hsnMap[code].igst += num(it.igst);
+        hsnMap[code].totalTax += num(it.gst);
+      });
+      const hsnList = Object.values(hsnMap);
+      const HSN_ROW_H = 4.8;
+      const HSN_HEAD_H = 9;
+      const hsnTableH = HSN_HEAD_H + HSN_ROW_H * (hsnList.length + 1);
+      const TAIL_H = WORDS_H + hsnTableH + TAXWORDS_H + BOTTOM_H;
+
+      // ---- drawing helpers ----
+      function drawFrame(top, title) {
+        font(true, 15);
+        text(title, 105, 9.5, { align: 'center' });
+        doc.rect(X0, top, W, SHEET_BOTTOM - top);
+        font(false, 7);
+        text('This is a Computer Generated Invoice', 105, SHEET_BOTTOM + 4.2, { align: 'center' });
+      }
+
+      function drawTopSection() {
+        const leftW = 100;
+        const splitX = X0 + leftW;
+        const midY = SHEET_TOP + 26;
+        const botY = SHEET_TOP + TOP_H;
+        ln(splitX, SHEET_TOP, splitX, botY);
+        ln(X0, midY, splitX, midY);
+        ln(X0, botY, X1, botY);
+
+        // supplier block with logo
+        let textX = X0 + 3;
+        if (H.logoDataUrl) {
+          try {
+            const bw = 22, bh = 22;
+            let w = bw, h = bh;
+            if (H.logoW && H.logoH) {
+              const r = H.logoW / H.logoH;
+              if (r > 1) h = bw / r; else w = bh * r;
+            }
+            doc.addImage(H.logoDataUrl, 'PNG', X0 + 2 + (bw - w) / 2, SHEET_TOP + 2 + (bh - h) / 2, w, h, undefined, 'FAST');
+            textX = X0 + 27;
+          } catch (e) { /* skip logo */ }
+        } else {
+          doc.setLineDashPattern([0.8, 0.8], 0);
+          doc.rect(X0 + 2, SHEET_TOP + 2, 22, 22);
+          doc.setLineDashPattern([], 0);
+          font(true, 6.5);
+          text('LOGO', X0 + 13, SHEET_TOP + 12.5, { align: 'center' });
+          textX = X0 + 27;
+        }
+        const maxTxtW = splitX - textX - 2;
+        let y = SHEET_TOP + 7;
+        font(true, 14);
+        const nameLines = wrap(String(s.businessName || 'ROYAL SANITATION').toUpperCase(), maxTxtW);
+        nameLines.slice(0, 2).forEach(l => { text(l, textX, y); y += 5.2; });
+        font(true, 9);
+        const addr = titleCase([s.address, s.city].filter(Boolean).join(', '));
+        if (addr) wrap(addr, maxTxtW).slice(0, 2).forEach(l => { text(l, textX, y); y += 4; });
+        text('GSTIN/UIN: ' + (s.gstin || '23CHLPD7073A1ZQ'), textX, y); y += 4;
+        text('State Name : ' + titleCase(s.state || 'Madhya Pradesh') + ', Code : ' + (codeFor(s.state) || '23'), textX, y);
+
+        // buyer block
+        const bx = X0 + 3;
+        let by = midY + 4;
+        font(true, 7.5);
+        text('Buyer (Bill to)', bx, by); by += 4.8;
+        font(true, 11);
+        wrap(titleCase(inv.partyName || '—'), leftW - 6).slice(0, 2).forEach(l => { text(l, bx, by); by += 4.8; });
+        font(true, 9);
+        const baddr = titleCase(inv.address || inv.city || '');
+        if (baddr) wrap(baddr, leftW - 6).slice(0, 2).forEach(l => { text(l, bx, by); by += 4; });
+        text('GSTIN/UIN : ' + (inv.gstin || '—'), bx, by); by += 4;
+        text('State Name : ' + titleCase(inv.state || '—') + ', Code : ' + (inv.stateCode || codeFor(inv.state) || '—'), bx, by);
+
+        // right meta grid
+        const mx0 = splitX, mw = X1 - splitX, cw = mw / 2, rh = TOP_H / 6;
+        const cells = [
+          ['Invoice No.', inv.number, 'Dated', fmtTallyDate(inv.date)],
+          ['Delivery Note', '', 'Mode/Terms of Payment', ''],
+          ['Reference No. & Date.', '', 'Other References', ''],
+          ["Buyer's Order No.", '', 'Dated', ''],
+          ['Dispatch Doc No.', '', 'Delivery Note Date', ''],
+          ['Dispatched through', '', 'Destination', titleCase(placeOfSupply)]
+        ];
+        ln(mx0 + cw, SHEET_TOP, mx0 + cw, botY);
+        cells.forEach((c, i) => {
+          const ry = SHEET_TOP + i * rh;
+          if (i > 0) ln(mx0, ry, X1, ry);
+          font(true, 6.8);
+          text(c[0], mx0 + 1.5, ry + 3.4);
+          text(c[2], mx0 + cw + 1.5, ry + 3.4);
+          font(true, 8);
+          if (c[1]) text(c[1], mx0 + 1.5, ry + 7.3);
+          if (c[3]) text(c[3], mx0 + cw + 1.5, ry + 7.3);
+        });
+      }
+
+      function drawItemsHeader(y) {
+        ln(X0, y, X1, y);
+        ln(X0, y + HEAD_H, X1, y + HEAD_H);
+        font(true, 7.5);
+        const cy = y + 5.3;
+        text('Sl', colX[0] + colW[0] / 2, y + 3.6, { align: 'center' });
+        text('No.', colX[0] + colW[0] / 2, y + 7.2, { align: 'center' });
+        text('Description of Goods', colX[1] + colW[1] / 2, cy, { align: 'center' });
+        text('HSN/SAC', colX[2] + colW[2] / 2, cy, { align: 'center' });
+        text('Quantity', colX[3] + colW[3] / 2, cy, { align: 'center' });
+        text('Rate', colX[4] + colW[4] / 2, y + 3.6, { align: 'center' });
+        font(false, 6);
+        text('(Incl. of Tax)', colX[4] + colW[4] / 2, y + 7.2, { align: 'center' });
+        font(true, 7.5);
+        text('Rate', colX[5] + colW[5] / 2, cy, { align: 'center' });
+        text('per', colX[6] + colW[6] / 2, cy, { align: 'center' });
+        text('Amount', colX[7] + colW[7] / 2, cy, { align: 'center' });
+        return y + HEAD_H;
+      }
+
+      function drawColumnLines(yTop, yBottom) {
+        for (let i = 1; i < colX.length - 1; i++) ln(colX[i], yTop - HEAD_H, colX[i], yBottom);
+      }
+
+      function drawRow(r, y) {
+        if (r.kind === 'item') {
+          const it = r.it;
+          const rateIncl = round2(num(it.rate) * (1 + num(it.gstRate) / 100));
+          const ty = y + 3.5;
+          font(false, 7.5);
+          text(String(r.idx + 1), colX[0] + colW[0] / 2, ty, { align: 'center' });
+          font(true, 8);
+          r.lines.forEach((l, k) => text(l, colX[1] + 1.5, ty + k * 3.6));
+          font(false, 7.5);
+          text(it.hsn || '—', colX[2] + colW[2] / 2, ty, { align: 'center' });
+          const unit = titleCase(it.unit || 'pcs');
+          text(num(it.qty).toFixed(2) + ' ' + unit, colX[4] - 1.5, ty, { align: 'right' });
+          text(moneyRaw(rateIncl), colX[5] - 1.5, ty, { align: 'right' });
+          text(moneyRaw(it.rate), colX[6] - 1.5, ty, { align: 'right' });
+          text(unit, colX[6] + colW[6] / 2, ty, { align: 'center' });
+          text(moneyRaw(it.taxable), colX[8] - 1.5, ty, { align: 'right' });
+        } else {
+          const ty = y + 3.2;
+          font(false, 7.5);
+          text(r.label, colX[2] - 3, ty, { align: 'right' });
+          if (r.rate) text(r.rate, colX[6] - 1.5, ty, { align: 'right' });
+          text(r.amt, colX[8] - 1.5, ty, { align: 'right' });
+        }
+      }
+
+      function drawTotalRow(y) {
+        ln(X0, y, X1, y);
+        ln(X0, y + TOTAL_H, X1, y + TOTAL_H);
+        const totalQty = items.reduce((sum, it) => sum + num(it.qty), 0);
+        font(true, 8);
+        text('Total', colX[2] - 3, y + 3.9, { align: 'right' });
+        text(totalQty.toFixed(2) + ' ' + (items[0] ? (items[0].unit || 'pcs') : 'pcs'), colX[4] - 1.5, y + 3.9, { align: 'right' });
+        font(true, 10);
+        text(RS + moneyRaw(inv.grandTotal), colX[8] - 1.5, y + 4.2, { align: 'right' });
+      }
+
+      function drawTail(y) {
+        // amount in words
+        font(true, 6.8);
+        text('Amount Chargeable (in words)', X0 + 1.5, y + 3.3);
+        font(true, 8);
+        text(numberWordsINR(inv.grandTotal), X0 + 1.5, y + 7.4);
+        font(false, 7.5);
+        text('E. & O.E', X1 - 1.5, y + 3.3, { align: 'right' });
+        y += WORDS_H;
+        ln(X0, y, X1, y);
+
+        // HSN / tax table
+        const ty0 = y;
+        let widths, hdr;
+        if (!isIntra) widths = [56, 46, 22, 36, 36]; else widths = [40, 32, 14, 30, 14, 30, 36];
+        const tx = [X0];
+        widths.forEach((w, i) => tx.push(tx[i] + w));
+        const half = HSN_HEAD_H / 2;
+        font(true, 7);
+        if (!isIntra) {
+          text('HSN/SAC', (tx[0] + tx[1]) / 2, ty0 + 5.3, { align: 'center' });
+          text('Taxable', (tx[1] + tx[2]) / 2, ty0 + 3.6, { align: 'center' });
+          text('Value', (tx[1] + tx[2]) / 2, ty0 + 7.2, { align: 'center' });
+          text('IGST', (tx[2] + tx[4]) / 2, ty0 + 3.3, { align: 'center' });
+          text('Rate', (tx[2] + tx[3]) / 2, ty0 + half + 3.3, { align: 'center' });
+          text('Amount', (tx[3] + tx[4]) / 2, ty0 + half + 3.3, { align: 'center' });
+          text('Total', (tx[4] + tx[5]) / 2, ty0 + 3.6, { align: 'center' });
+          text('Tax Amount', (tx[4] + tx[5]) / 2, ty0 + 7.2, { align: 'center' });
+          ln(tx[2], ty0 + half, tx[4], ty0 + half);
+        } else {
+          text('HSN/SAC', (tx[0] + tx[1]) / 2, ty0 + 5.3, { align: 'center' });
+          text('Taxable', (tx[1] + tx[2]) / 2, ty0 + 3.6, { align: 'center' });
+          text('Value', (tx[1] + tx[2]) / 2, ty0 + 7.2, { align: 'center' });
+          text('Central Tax', (tx[2] + tx[4]) / 2, ty0 + 3.3, { align: 'center' });
+          text('State Tax', (tx[4] + tx[6]) / 2, ty0 + 3.3, { align: 'center' });
+          text('Rate', (tx[2] + tx[3]) / 2, ty0 + half + 3.3, { align: 'center' });
+          text('Amount', (tx[3] + tx[4]) / 2, ty0 + half + 3.3, { align: 'center' });
+          text('Rate', (tx[4] + tx[5]) / 2, ty0 + half + 3.3, { align: 'center' });
+          text('Amount', (tx[5] + tx[6]) / 2, ty0 + half + 3.3, { align: 'center' });
+          text('Total', (tx[6] + tx[7]) / 2, ty0 + 3.6, { align: 'center' });
+          text('Tax Amount', (tx[6] + tx[7]) / 2, ty0 + 7.2, { align: 'center' });
+          ln(tx[2], ty0 + half, tx[4], ty0 + half);
+          ln(tx[4], ty0 + half, tx[6], ty0 + half);
+        }
+        ln(X0, ty0 + HSN_HEAD_H, X1, ty0 + HSN_HEAD_H);
+
+        let ry = ty0 + HSN_HEAD_H;
+        font(true, 7.5);
+        hsnList.forEach(h => {
+          const b = ry + 3.4;
+          text(h.hsn, tx[0] + 1.5, b);
+          text(moneyRaw(h.taxable), tx[2] - 1.5, b, { align: 'right' });
+          if (!isIntra) {
+            text(num(h.gstRate) + '%', (tx[2] + tx[3]) / 2, b, { align: 'center' });
+            text(moneyRaw(h.igst || h.totalTax), tx[4] - 1.5, b, { align: 'right' });
+            text(moneyRaw(h.totalTax), tx[5] - 1.5, b, { align: 'right' });
+          } else {
+            text((num(h.gstRate) / 2) + '%', (tx[2] + tx[3]) / 2, b, { align: 'center' });
+            text(moneyRaw(h.cgst), tx[4] - 1.5, b, { align: 'right' });
+            text((num(h.gstRate) / 2) + '%', (tx[4] + tx[5]) / 2, b, { align: 'center' });
+            text(moneyRaw(h.sgst), tx[6] - 1.5, b, { align: 'right' });
+            text(moneyRaw(h.totalTax), tx[7] - 1.5, b, { align: 'right' });
+          }
+          ry += HSN_ROW_H;
+          ln(X0, ry, X1, ry);
+        });
+        // total row
+        const b = ry + 3.4;
+        text('Total', tx[1] - 1.5, b, { align: 'right' });
+        text(moneyRaw(inv.taxable), tx[2] - 1.5, b, { align: 'right' });
+        if (!isIntra) {
+          text(moneyRaw(inv.totalGst), tx[4] - 1.5, b, { align: 'right' });
+          text(moneyRaw(inv.totalGst), tx[5] - 1.5, b, { align: 'right' });
+        } else {
+          text(moneyRaw(inv.cgst), tx[4] - 1.5, b, { align: 'right' });
+          text(moneyRaw(inv.sgst), tx[6] - 1.5, b, { align: 'right' });
+          text(moneyRaw(inv.totalGst), tx[7] - 1.5, b, { align: 'right' });
+        }
+        ry += HSN_ROW_H;
+        ln(X0, ry, X1, ry);
+        // vertical lines of the tax table
+        for (let i = 1; i < tx.length - 1; i++) {
+          if (!isIntra && i === 3) ln(tx[i], ty0 + half, tx[i], ry);
+          else if (isIntra && (i === 3 || i === 5)) ln(tx[i], ty0 + half, tx[i], ry);
+          else ln(tx[i], ty0, tx[i], ry);
+        }
+
+        // tax amount in words
+        font(false, 7.5);
+        text('Tax Amount (in words) : ', X0 + 1.5, ry + 4);
+        const lblW = doc.getTextWidth('Tax Amount (in words) : ');
+        font(true, 7.5);
+        text(numberWordsINR(inv.totalGst), X0 + 1.5 + lblW, ry + 4);
+        ry += TAXWORDS_H;
+        ln(X0, ry, X1, ry);
+
+        // bottom: bank + declaration | signatory
+        const splitX = X0 + 100;
+        ln(splitX, ry, splitX, SHEET_BOTTOM);
+        const bankH = 25;
+        ln(X0, ry + bankH, splitX, ry + bankH);
+        font(true, 8);
+        text("Company's Bank Details", X0 + 1.5, ry + 4.6);
+        const bankRows = [
+          ['Bank Name', s.bankName || ''],
+          ['A/c No.', s.accountNumber || ''],
+          ['Branch', s.branch || ''],
+          ['Ifsc Code', s.ifsc || '']
+        ];
+        bankRows.forEach((r, i) => {
+          const by = ry + 9 + i * 4;
+          font(true, 7.5);
+          text(r[0].toUpperCase(), X0 + 1.5, by);
+          text(': ' + String(r[1]).toUpperCase(), X0 + 22, by);
+        });
+        let dy = ry + bankH + 3.6;
+        font(true, 7.5);
+        text('Declaration', X0 + 1.5, dy); dy += 3.2;
+        font(false, 6.6);
+        wrap('We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.', 96).forEach(l => { text(l, X0 + 1.5, dy); dy += 2.7; });
+        const terms = String(inv.notes || s.terms || '1. Goods once sold will not be taken back.\n2. Please inspect goods at the time of delivery.\n3. Subject to local jurisdiction only.')
+          .split('\n').map(t => t.trim()).filter(Boolean);
+        terms.forEach(t => wrap(t, 96).forEach(l => { if (dy < SHEET_BOTTOM - 1) { text(l, X0 + 1.5, dy); dy += 2.7; } }));
+
+        font(false, 8);
+        const forTxt = 'for ';
+        const biz = String(s.businessName || 'ROYAL SANITATION');
+        font(true, 8);
+        const bw = doc.getTextWidth(biz);
+        font(false, 8);
+        const fw = doc.getTextWidth(forTxt);
+        text(forTxt, X1 - 2 - bw - fw, ry + 4.5);
+        font(true, 8);
+        text(biz, X1 - 2, ry + 4.5, { align: 'right' });
+        font(false, 7.5);
+        text(s.signatory || 'Authorised Signatory', X1 - 2, SHEET_BOTTOM - 2.5, { align: 'right' });
+      }
+
+      // ---- paginate ----
+      const availFinalFull = SHEET_BOTTOM - TAIL_H - TOTAL_H;
+      let remaining = rows.slice();
+      let page = 0;
+      while (true) {
+        if (page > 0) doc.addPage();
+        drawFrame(SHEET_TOP, page === 0 ? 'Tax Invoice' : 'Tax Invoice (continued)');
+        let yStart;
+        if (page === 0) {
+          drawTopSection();
+          yStart = drawItemsHeader(SHEET_TOP + TOP_H);
+        } else {
+          yStart = drawItemsHeader(SHEET_TOP);
+        }
+        const sum = remaining.reduce((a, r) => a + r.h, 0);
+        if (sum <= availFinalFull - yStart) {
+          // final page
+          let y = yStart;
+          remaining.forEach(r => { drawRow(r, y); y += r.h; });
+          drawColumnLines(yStart, availFinalFull);
+          drawTotalRow(availFinalFull);
+          drawTail(SHEET_BOTTOM - TAIL_H);
+          break;
+        }
+        // intermediate page: take as many rows as fit, but leave at least one for the next page
+        const availBottom = SHEET_BOTTOM - 5;
+        let y = yStart, taken = 0;
+        while (taken < remaining.length && y + remaining[taken].h <= availBottom) { y += remaining[taken].h; taken++; }
+        if (taken >= remaining.length) taken = remaining.length - 1;
+        if (taken < 1) taken = 1;
+        y = yStart;
+        remaining.slice(0, taken).forEach(r => { drawRow(r, y); y += r.h; });
+        drawColumnLines(yStart, SHEET_BOTTOM);
+        font(false, 7);
+        text('continued ...', X1 - 2, SHEET_BOTTOM - 1.5, { align: 'right' });
+        remaining = remaining.slice(taken);
+        page++;
+        if (page > 40) break;
+      }
+
+      return doc.output('blob');
+    }
+
+
+
+    /** Build the invoice as a real text PDF (selectable and copyable text). */
     async function createInvoicePdfBlob(inv) {
       const pdfAvailable = await loadHtml2Pdf();
       if (!pdfAvailable) throw new Error('PDF generator unavailable. Check your internet connection and try again.');
 
       const fileName = getInvoiceFileName(inv);
-      const printHtml = generateInvoiceHtml(inv, fileName);
-      const frame = document.createElement('iframe');
-      frame.setAttribute('aria-hidden', 'true');
-      frame.style.cssText = 'position:fixed;left:-12000px;top:0;width:794px;height:1123px;border:0;visibility:hidden;pointer-events:none;';
-      document.body.appendChild(frame);
-
-      try {
-        const doc = frame.contentDocument;
-        doc.open();
-        doc.write(printHtml);
-        doc.close();
-        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-
-        const targetEl = doc.querySelector('.print-wrapper');
-        if (!targetEl) throw new Error('Could not find the invoice layout in the generated document.');
-
-        // Match the native A4 print layout. Do not shrink the invoice to an arbitrary pixel width
-        // or remove its intended flex layout; that was causing clipped columns and stretched rows.
-        const pdfStyle = doc.createElement('style');
-        pdfStyle.textContent = `
-          html, body { width: 210mm !important; min-width: 210mm !important; margin: 0 !important; padding: 0 !important; background: #fff !important; overflow: visible !important; }
-          .print-wrapper { width: 196mm !important; min-width: 196mm !important; max-width: 196mm !important; height: 287mm !important; margin: 0 auto !important; padding: 0 !important; display: flex !important; flex-direction: column !important; box-sizing: border-box !important; box-shadow: none !important; overflow: visible !important; }
-          .sheet { width: 100% !important; flex: 1 1 auto !important; min-height: 0 !important; box-sizing: border-box !important; box-shadow: none !important; background: #fff !important; }
-          .bottom-left table { width: 100% !important; border-collapse: collapse !important; border-spacing: 0 !important; }
-          .bottom-left table td { padding: 0.5px 2px !important; line-height: 1.15 !important; background: #fff !important; }
-          .computer-footer { position: static !important; padding: 2px 0 0 !important; flex: 0 0 auto !important; }
-          * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-        `;
-        doc.head.appendChild(pdfStyle);
-        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-
-        const opt = {
-          margin: [5, 7, 5, 7],
-          filename: `${fileName}.pdf`,
-          image: { type: 'jpeg', quality: 0.98 },
-          html2canvas: {
-            scale: 2,
-            useCORS: true,
-            logging: false,
-            backgroundColor: '#ffffff',
-            scrollX: 0,
-            scrollY: 0,
-            windowWidth: 794,
-            width: targetEl.scrollWidth
-          },
-          pagebreak: { mode: ['css', 'legacy'], avoid: ['.bottom-section', '.tax-tbl'] },
-          jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-        };
-        const pdfBlob = await window.html2pdf().set(opt).from(targetEl).outputPdf('blob');
-        if (!(pdfBlob instanceof Blob) || pdfBlob.size === 0) throw new Error('The generated PDF was empty.');
-        return { blob: pdfBlob, fileName };
-      } finally {
-        frame.remove();
-      }
+      const s = inv.supplierSnapshot || db.settings;
+      const [fonts, logo] = await Promise.all([
+        loadPdfFonts(),
+        prepareLogoForPdf((s && s.logo) || (db.settings && db.settings.logo) || '')
+      ]);
+      const blob = await buildInvoiceTextPdf(inv, s, {
+        jsPDF: window.jspdf.jsPDF,
+        num, round2, moneyRaw, titleCase, fmtTallyDate, codeFor, numberWordsINR,
+        ...fonts, ...logo
+      });
+      if (!(blob instanceof Blob) || blob.size === 0) throw new Error('The generated PDF was empty.');
+      return { blob, fileName };
     }
 
     function downloadBlob(filename, blob) {
