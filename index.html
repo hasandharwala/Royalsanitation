@@ -1062,7 +1062,8 @@
         ifsc: '',
         branch: '',
         signatory: 'Authorised Signatory',
-        logo: ''
+        logo: '',
+        qr: ''
       },
       invoices: [],
       parties: [],
@@ -2534,6 +2535,17 @@
                   <label>Authorized Signatory Title</label>
                   <input name="signatory" value="${esc(s.signatory)}">
                 </div>
+                <div class="field span2">
+                  <label>Payment QR Code (printed in the bank details box)</label>
+                  <input type="file" id="qr-file" accept="image/png,image/jpeg,image/webp">
+                  ${s.qr ? `
+                    <div style="display:flex;align-items:center;gap:12px;margin-top:8px;">
+                      <img class="logo-preview" src="${esc(safeImageSrc(s.qr))}" alt="QR code preview" loading="lazy">
+                      <button class="danger small" type="button" data-action="remove-qr">Remove QR</button>
+                    </div>
+                  ` : ''}
+                  <div class="settings-note">Upload your UPI / payment QR as PNG or JPG under 500 KB. Use a clear, square image.</div>
+                </div>
               </div>
             </div>
             
@@ -2573,10 +2585,56 @@
     }
 
     /** Generate standalone print-ready HTML for the invoice */
+    /** Supplier details for an invoice. Tax identity (GSTIN, legal name) stays as frozen on the invoice;
+        address, contact details, logo and QR always follow the current Business Settings. */
+    function invoiceSupplier(inv) {
+      const live = db.settings || {};
+      const snap = (inv && inv.supplierSnapshot) || {};
+      const out = { ...live, ...snap };
+      Object.keys(live).forEach(k => {
+        if (snap[k] === undefined || snap[k] === null || snap[k] === '') out[k] = live[k];
+      });
+      ['address', 'city', 'pincode', 'phone', 'whatsapp', 'email', 'website', 'qr', 'logo'].forEach(k => {
+        if (live[k]) out[k] = live[k];
+      });
+      return out;
+    }
+
+    /** Full Registered Business Address, line by line, exactly as typed in Business Settings. */
+    function supplierAddressLines(s) {
+      const lines = String((s && s.address) || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const all = lines.join(' ').toLowerCase();
+      const extra = [];
+      const city = String((s && s.city) || '').trim();
+      const pin = String((s && s.pincode) || '').trim();
+      if (city && !all.includes(city.toLowerCase())) extra.push(city);
+      if (pin && !all.includes(pin)) extra.push(pin);
+      if (extra.length) lines.push(extra.join(' - '));
+      // one single line: address parts and city together
+      const oneLine = lines.map(l => l.replace(/[,\s]+$/, '')).filter(Boolean).join(', ');
+      return oneLine ? [oneLine] : [];
+    }
+
+    /** One contact line for under the firm name: phone, WhatsApp (if different) and email. */
+    function supplierContactLine(s) {
+      const phone = String((s && s.phone) || '').trim();
+      const wa = String((s && s.whatsapp) || '').trim();
+      const email = String((s && s.email) || '').trim();
+      const last10 = v => String(v).replace(/\D/g, '').slice(-10);
+      const parts = [];
+      if (phone) parts.push('Ph: ' + phone);
+      if (wa && last10(wa) !== last10(phone)) parts.push('WhatsApp: ' + wa);
+      if (email) parts.push('Email: ' + email);
+      return parts.join('  |  ');
+    }
+
     function generateInvoiceHtml(inv, customTitle = '') {
       const docTitle = customTitle || getInvoiceFileName(inv);
-      const s = inv.supplierSnapshot || db.settings;
-      const logoSrc = safeImageSrc((s && s.logo) || (db.settings && db.settings.logo) || '');
+      const s = invoiceSupplier(inv);
+      const logoSrc = safeImageSrc((s && s.logo) || '');
+      const qrSrc = safeImageSrc((s && s.qr) || '');
+      const supAddrLines = supplierAddressLines(s);
+      const supContact = supplierContactLine(s);
       const placeOfSupply = inv.state || inv.placeOfSupply || 'Maharashtra';
       const supplierState = 'Madhya Pradesh';
       const isIntra = placeOfSupply === supplierState;
@@ -2681,8 +2739,8 @@
       flex-direction: column;
     }
     .top-left .box-block {
-      flex: 1 1 0%;
-      min-height: 97px;
+      flex: 1 1 auto;
+      min-height: 90px;
       box-sizing: border-box;
       padding: 5px 8px;
       font-size: 10.5px;
@@ -2765,7 +2823,7 @@
     .items-tbl td {
       border-right: 1px solid #000;
       border-bottom: none;
-      padding: 2.5px 4px;
+      padding: 1.5px 4px;
       font-size: 10.5px;
       font-weight: 400;
       vertical-align: top;
@@ -2883,6 +2941,16 @@
       display: flex;
       flex-direction: column;
     }
+    .bottom-mid {
+      width: 22%;
+      border-right: 1px solid #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2px;
+      box-sizing: border-box;
+    }
     .bottom-right {
       width: 49%;
       display: flex;
@@ -2952,10 +3020,11 @@
               </div>
             `}
             <div style="flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;">
-              <div style="font-size:20px;font-weight:700;line-height:1.2;text-transform:uppercase;letter-spacing:0.3px;">${esc(String(s.businessName || 'ROYAL SANITATION').toUpperCase())}</div>
-              ${(s.address || s.city) ? `<div style="font-size:14px;line-height:1.25;margin-top:2px;font-weight:700;text-transform:capitalize;">${esc(titleCase([s.address, s.city].filter(Boolean).join(', ')))}</div>` : ''}
-              <div style="font-size:14px;line-height:1.25;margin-top:2px;font-weight:700;">GSTIN/UIN: <b>${esc(s.gstin || '23CHLPD7073A1ZQ')}</b></div>
-              <div style="font-size:14px;line-height:1.25;font-weight:700;">State Name : <b style="text-transform:capitalize;">${esc(titleCase(s.state || 'Madhya Pradesh'))}</b>, Code : <b>${esc(codeFor(s.state) || '23')}</b></div>
+              <div style="font-size:19px;font-weight:700;line-height:1.15;text-transform:uppercase;letter-spacing:0.3px;">${esc(String(s.businessName || 'ROYAL SANITATION').toUpperCase())}</div>
+              ${supContact ? `<div style="font-size:12.5px;line-height:1.2;margin-top:1px;font-weight:600;">${esc(supContact)}</div>` : ''}
+              ${supAddrLines.length ? `<div style="font-size:12.5px;line-height:1.2;margin-top:1px;font-weight:700;">${supAddrLines.map(l => esc(l)).join('<br>')}</div>` : ''}
+              <div style="font-size:12.5px;line-height:1.2;margin-top:1px;font-weight:700;">GSTIN/UIN: <b>${esc(s.gstin || '23CHLPD7073A1ZQ')}</b></div>
+              <div style="font-size:12.5px;line-height:1.2;font-weight:400;">State Name : <span style="text-transform:capitalize;">${esc(titleCase(s.state || 'Madhya Pradesh'))}</span>, Code : <span>${esc(codeFor(s.state) || '23')}</span></div>
             </div>
           </div>
 
@@ -2965,7 +3034,7 @@
             <div style="font-weight:800;font-size:16px;line-height:1.2;margin-bottom:2px;text-transform:capitalize;">${esc(titleCase(inv.partyName || '—'))}</div>
             ${(inv.address || inv.city) ? `<div style="font-size:14px;line-height:1.25;font-weight:700;text-transform:capitalize;">${esc(titleCase(inv.address || inv.city))}</div>` : ''}
             <div style="font-size:14px;line-height:1.25;font-weight:700;">GSTIN/UIN &nbsp; : <b>${esc(inv.gstin || '—')}</b></div>
-            <div style="font-size:14px;line-height:1.25;font-weight:700;">State Name : <b style="text-transform:capitalize;">${esc(titleCase(inv.state || '—'))}</b>, Code : <b>${esc(inv.stateCode || codeFor(inv.state) || '—')}</b></div>
+            <div style="font-size:12px;line-height:1.25;font-weight:400;">State Name : <span style="text-transform:capitalize;">${esc(titleCase(inv.state || '—'))}</span>, Code : <span>${esc(inv.stateCode || codeFor(inv.state) || '—')}</span></div>
           </div>
         </div>
 
@@ -3045,24 +3114,23 @@
             <th>Description of Goods</th>
             <th style="width:68px;">HSN/SAC</th>
             <th style="width:78px;">Quantity</th>
-            <th style="width:74px;">Rate<br><span style="font-size:10px;font-weight:normal;">(Incl. of Tax)</span></th>
-            <th style="width:62px;">Rate</th>
-            <th style="width:34px;">per</th>
+            <th style="width:68px;">Rate</th>
+            <th style="width:52px;">GST %</th>
+            <th style="width:76px;">GST</th>
             <th style="width:92px;">Amount</th>
           </tr>
         </thead>
         <tbody>
           ${items.map((it, idx) => {
-            const rateIncl = round2(num(it.rate) * (1 + num(it.gstRate) / 100));
             return `
               <tr class="item-row">
                 <td style="text-align:center;">${idx + 1}</td>
                 <td style="font-size:12px;font-weight:700;text-transform:capitalize;">${esc(titleCase(it.description))}</td>
                 <td style="text-align:center;">${esc(it.hsn || '—')}</td>
                 <td style="text-align:right;">${num(it.qty).toFixed(2)} ${esc(titleCase(it.unit || 'pcs'))}</td>
-                <td style="text-align:right;">${moneyRaw(rateIncl)}</td>
                 <td style="text-align:right;">${moneyRaw(it.rate)}</td>
-                <td style="text-align:center;text-transform:capitalize;">${esc(titleCase(it.unit || 'pcs'))}</td>
+                <td style="text-align:center;">${num(it.gstRate)}%</td>
+                <td style="text-align:right;">${moneyRaw(it.gst)}</td>
                 <td style="text-align:right;">${moneyRaw(it.taxable)}</td>
               </tr>
             `;
@@ -3129,7 +3197,7 @@
             <td style="text-align:right;font-weight:600;">${totalQty.toFixed(2)} ${esc(items[0]?.unit || 'pcs')}</td>
             <td></td>
             <td></td>
-            <td></td>
+            <td style="text-align:right;font-weight:600;">${moneyRaw(inv.totalGst)}</td>
             <td style="text-align:right;white-space:nowrap;font-size:14px;font-weight:700;">₹${moneyRaw(inv.grandTotal)}</td>
           </tr>
         </tfoot>
@@ -3235,15 +3303,17 @@
       <!-- BOTTOM SECTION: BANK DETAILS, DECLARATION & SIGNATORY -->
       <div class="bottom-section">
         <!-- Left: Bank Details & Declaration -->
-        <div class="bottom-left">
+        <div class="bottom-left"${qrSrc ? ' style="width:42%;"' : ''}>
           <div class="box-block" style="text-transform:uppercase;">
-            <b style="font-size:12px;font-weight:600;">Company's Bank Details</b><br>
-            <table style="font-size:12px;font-weight:600;margin-top:1px;line-height:1.25;text-transform:uppercase;">
-              <tr><td style="padding:0.5px 0;width:78px;">Bank Name</td><td>: <b>${esc(bankName)}</b></td></tr>
-              <tr><td style="padding:0.5px 0;">A/c No.</td><td>: <b>${esc(acNo)}</b></td></tr>
-              <tr><td style="padding:0.5px 0;">Branch</td><td>: <b>${esc(branchName)}</b></td></tr>
-              <tr><td style="padding:0.5px 0;">Ifsc Code</td><td>: <b>${esc(ifscCode)}</b></td></tr>
-            </table>
+            <div style="min-width:0;">
+              <b style="font-size:12px;font-weight:600;">Company's Bank Details</b><br>
+              <table style="font-size:12px;font-weight:600;margin-top:1px;line-height:1.25;text-transform:uppercase;">
+                <tr><td style="padding:0.5px 0;width:78px;">Bank Name</td><td>: <b>${esc(bankName)}</b></td></tr>
+                <tr><td style="padding:0.5px 0;">A/c No.</td><td>: <b>${esc(acNo)}</b></td></tr>
+                <tr><td style="padding:0.5px 0;">Branch</td><td>: <b>${esc(branchName)}</b></td></tr>
+                <tr><td style="padding:0.5px 0;">Ifsc Code</td><td>: <b>${esc(ifscCode)}</b></td></tr>
+              </table>
+            </div>
           </div>
 
           <div class="decl-block">
@@ -3259,8 +3329,16 @@
           </div>
         </div>
 
+        ${qrSrc ? `
+        <!-- Middle: Payment QR code -->
+        <div class="bottom-mid">
+          <img src="${esc(qrSrc)}" alt="Payment QR code" style="flex:1 1 0;min-height:0;width:100%;object-fit:contain;display:block;background:#fff;">
+          <div style="font-size:9px;font-weight:700;line-height:1;margin-top:2px;">Scan to Pay</div>
+        </div>
+        ` : ''}
+
         <!-- Right: Authorized Signatory -->
-        <div class="bottom-right">
+        <div class="bottom-right"${qrSrc ? ' style="width:36%;"' : ''}>
           <div>
             for <b>${esc(s.businessName || 'ROYAL SANITATION')}</b>
           </div>
@@ -3372,7 +3450,7 @@
     }
 
     /** Turn the saved logo into a PNG data URL that jsPDF can embed. */
-    function prepareLogoForPdf(src) {
+    function prepareLogoForPdf(src, whiteBackground = false) {
       return new Promise(resolve => {
         const safe = safeImageSrc(src);
         if (!safe) return resolve({});
@@ -3381,7 +3459,9 @@
           try {
             const c = document.createElement('canvas');
             c.width = img.naturalWidth || 1; c.height = img.naturalHeight || 1;
-            c.getContext('2d').drawImage(img, 0, 0);
+            const g = c.getContext('2d');
+            if (whiteBackground) { g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); }
+            g.drawImage(img, 0, 0);
             resolve({ logoDataUrl: c.toDataURL('image/png'), logoW: c.width, logoH: c.height });
           } catch (e) { resolve({}); }
         };
@@ -3392,7 +3472,7 @@
 
     /* Draws the GST tax invoice as a real text PDF (selectable / copyable text) with jsPDF. */
     async function buildInvoiceTextPdf(inv, s, H) {
-      const { jsPDF, num, round2, moneyRaw, titleCase, fmtTallyDate, codeFor, numberWordsINR } = H;
+      const { jsPDF, num, round2, moneyRaw, titleCase, fmtTallyDate, codeFor, numberWordsINR, supplierAddressLines, supplierContactLine } = H;
       const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
 
       // ---- fonts: Inter when available (has the rupee sign), otherwise built-in Helvetica ----
@@ -3425,7 +3505,21 @@
       // ---- geometry (mm) ----
       const X0 = 7, W = 196, X1 = X0 + W;
       const SHEET_TOP = 13, SHEET_BOTTOM = 288;
-      const TOP_H = 52;            // supplier/buyer + meta block
+      const LEFT_W = 100;
+      const SUP_TEXT_X = X0 + 27;
+      const SUP_TEXT_W = (X0 + LEFT_W) - SUP_TEXT_X - 2;
+      // supplier block lines (name, contact, full address, GSTIN, state) decide how tall the top block is
+      font(true, 14);
+      const supNameLines = wrap(String(s.businessName || 'ROYAL SANITATION').toUpperCase(), SUP_TEXT_W).slice(0, 2);
+      font(false, 9);
+      const supContact = supplierContactLine ? supplierContactLine(s) : '';
+      const supContactLines = supContact ? wrap(supContact, SUP_TEXT_W).slice(0, 2) : [];
+      font(true, 9);
+      const supAddrLines = (supplierAddressLines ? supplierAddressLines(s) : []).flatMap(l => wrap(l, SUP_TEXT_W)).slice(0, 6);
+      const SUP_NEED = 6.5 + supNameLines.length * 5.2 + supContactLines.length * 4 + supAddrLines.length * 4 + 4 + 4 + 3;
+      const SUP_H = Math.max(26, SUP_NEED);
+      const BUYER_H = 26;
+      const TOP_H = SUP_H + BUYER_H;   // supplier/buyer + meta block
       const HEAD_H = 9;            // items table header
       const TOTAL_H = 5.5;         // items "Total" row
       const TAX_ROW_H = 4.2;
@@ -3438,7 +3532,7 @@
       const items = inv.items || [];
 
       // ---- items table columns ----
-      const colW = [8, 78, 18, 22, 20, 17, 9, 24];
+      const colW = [8, 72, 18, 22, 20, 13, 19, 24];
       const colX = [X0];
       colW.forEach((w, i) => colX.push(colX[i] + w));
       const DESC_W = colW[1] - 3;
@@ -3447,7 +3541,7 @@
       const rows = [];
       items.forEach((it, idx) => {
         const lines = wrap(titleCase(it.description), DESC_W);
-        rows.push({ kind: 'item', it, idx, lines, h: Math.max(4.8, lines.length * 3.6 + 1.4) });
+        rows.push({ kind: 'item', it, idx, lines, h: Math.max(4.5, lines.length * 3.5 + 1.0) });
       });
       const gstRate = num((items[0] && items[0].gstRate) || 18);
       if (!isIntra) {
@@ -3489,14 +3583,14 @@
       function drawTopSection() {
         const leftW = 100;
         const splitX = X0 + leftW;
-        const midY = SHEET_TOP + 26;
+        const midY = SHEET_TOP + SUP_H;
         const botY = SHEET_TOP + TOP_H;
         ln(splitX, SHEET_TOP, splitX, botY);
         ln(X0, midY, splitX, midY);
         ln(X0, botY, X1, botY);
 
         // supplier block with logo
-        let textX = X0 + 3;
+        let textX = SUP_TEXT_X;
         if (H.logoDataUrl) {
           try {
             const bw = 22, bh = 22;
@@ -3506,7 +3600,6 @@
               if (r > 1) h = bw / r; else w = bh * r;
             }
             doc.addImage(H.logoDataUrl, 'PNG', X0 + 2 + (bw - w) / 2, SHEET_TOP + 2 + (bh - h) / 2, w, h, undefined, 'FAST');
-            textX = X0 + 27;
           } catch (e) { /* skip logo */ }
         } else {
           doc.setLineDashPattern([0.8, 0.8], 0);
@@ -3514,17 +3607,18 @@
           doc.setLineDashPattern([], 0);
           font(true, 6.5);
           text('LOGO', X0 + 13, SHEET_TOP + 12.5, { align: 'center' });
-          textX = X0 + 27;
         }
-        const maxTxtW = splitX - textX - 2;
-        let y = SHEET_TOP + 7;
+        let y = SHEET_TOP + 6.5;
         font(true, 14);
-        const nameLines = wrap(String(s.businessName || 'ROYAL SANITATION').toUpperCase(), maxTxtW);
-        nameLines.slice(0, 2).forEach(l => { text(l, textX, y); y += 5.2; });
+        supNameLines.forEach(l => { text(l, textX, y); y += 5.2; });
+        if (supContactLines.length) {
+          font(false, 9);
+          supContactLines.forEach(l => { text(l, textX, y); y += 4; });
+        }
         font(true, 9);
-        const addr = titleCase([s.address, s.city].filter(Boolean).join(', '));
-        if (addr) wrap(addr, maxTxtW).slice(0, 2).forEach(l => { text(l, textX, y); y += 4; });
+        supAddrLines.forEach(l => { text(l, textX, y); y += 4; });
         text('GSTIN/UIN: ' + (s.gstin || '23CHLPD7073A1ZQ'), textX, y); y += 4;
+        font(false, 9);
         text('State Name : ' + titleCase(s.state || 'Madhya Pradesh') + ', Code : ' + (codeFor(s.state) || '23'), textX, y);
 
         // buyer block
@@ -3538,6 +3632,7 @@
         const baddr = titleCase(inv.address || inv.city || '');
         if (baddr) wrap(baddr, leftW - 6).slice(0, 2).forEach(l => { text(l, bx, by); by += 4; });
         text('GSTIN/UIN : ' + (inv.gstin || '—'), bx, by); by += 4;
+        font(false, 8);
         text('State Name : ' + titleCase(inv.state || '—') + ', Code : ' + (inv.stateCode || codeFor(inv.state) || '—'), bx, by);
 
         // right meta grid
@@ -3573,12 +3668,9 @@
         text('Description of Goods', colX[1] + colW[1] / 2, cy, { align: 'center' });
         text('HSN/SAC', colX[2] + colW[2] / 2, cy, { align: 'center' });
         text('Quantity', colX[3] + colW[3] / 2, cy, { align: 'center' });
-        text('Rate', colX[4] + colW[4] / 2, y + 3.6, { align: 'center' });
-        font(false, 6);
-        text('(Incl. of Tax)', colX[4] + colW[4] / 2, y + 7.2, { align: 'center' });
-        font(true, 7.5);
-        text('Rate', colX[5] + colW[5] / 2, cy, { align: 'center' });
-        text('per', colX[6] + colW[6] / 2, cy, { align: 'center' });
+        text('Rate', colX[4] + colW[4] / 2, cy, { align: 'center' });
+        text('GST %', colX[5] + colW[5] / 2, cy, { align: 'center' });
+        text('GST', colX[6] + colW[6] / 2, cy, { align: 'center' });
         text('Amount', colX[7] + colW[7] / 2, cy, { align: 'center' });
         return y + HEAD_H;
       }
@@ -3590,25 +3682,24 @@
       function drawRow(r, y) {
         if (r.kind === 'item') {
           const it = r.it;
-          const rateIncl = round2(num(it.rate) * (1 + num(it.gstRate) / 100));
           const ty = y + 3.5;
           font(false, 7.5);
           text(String(r.idx + 1), colX[0] + colW[0] / 2, ty, { align: 'center' });
           font(true, 8);
-          r.lines.forEach((l, k) => text(l, colX[1] + 1.5, ty + k * 3.6));
+          r.lines.forEach((l, k) => text(l, colX[1] + 1.5, ty + k * 3.5));
           font(false, 7.5);
           text(it.hsn || '—', colX[2] + colW[2] / 2, ty, { align: 'center' });
           const unit = titleCase(it.unit || 'pcs');
           text(num(it.qty).toFixed(2) + ' ' + unit, colX[4] - 1.5, ty, { align: 'right' });
-          text(moneyRaw(rateIncl), colX[5] - 1.5, ty, { align: 'right' });
-          text(moneyRaw(it.rate), colX[6] - 1.5, ty, { align: 'right' });
-          text(unit, colX[6] + colW[6] / 2, ty, { align: 'center' });
+          text(moneyRaw(it.rate), colX[5] - 1.5, ty, { align: 'right' });
+          text(num(it.gstRate) + '%', colX[5] + colW[5] / 2, ty, { align: 'center' });
+          text(moneyRaw(it.gst), colX[7] - 1.5, ty, { align: 'right' });
           text(moneyRaw(it.taxable), colX[8] - 1.5, ty, { align: 'right' });
         } else {
           const ty = y + 3.2;
           font(false, 7.5);
           text(r.label, colX[2] - 3, ty, { align: 'right' });
-          if (r.rate) text(r.rate, colX[6] - 1.5, ty, { align: 'right' });
+          if (r.rate) text(r.rate, colX[5] + colW[5] / 2, ty, { align: 'center' });
           text(r.amt, colX[8] - 1.5, ty, { align: 'right' });
         }
       }
@@ -3620,6 +3711,7 @@
         font(true, 8);
         text('Total', colX[2] - 3, y + 3.9, { align: 'right' });
         text(totalQty.toFixed(2) + ' ' + (items[0] ? (items[0].unit || 'pcs') : 'pcs'), colX[4] - 1.5, y + 3.9, { align: 'right' });
+        text(moneyRaw(inv.totalGst), colX[7] - 1.5, y + 3.9, { align: 'right' });
         font(true, 10);
         text(RS + moneyRaw(inv.grandTotal), colX[8] - 1.5, y + 4.2, { align: 'right' });
       }
@@ -3721,8 +3813,13 @@
         ln(X0, ry, X1, ry);
 
         // bottom: bank + declaration | signatory
-        const splitX = X0 + 100;
+        const hasQr = !!H.qrDataUrl;
+        // with a QR code the bottom splits in three: bank + terms | QR | signatory
+        const leftW = hasQr ? 82 : 100;
+        const midW = hasQr ? 44 : 0;
+        const splitX = X0 + leftW;
         ln(splitX, ry, splitX, SHEET_BOTTOM);
+        if (hasQr) ln(splitX + midW, ry, splitX + midW, SHEET_BOTTOM);
         const bankH = 25;
         ln(X0, ry + bankH, splitX, ry + bankH);
         font(true, 8);
@@ -3733,20 +3830,40 @@
           ['Branch', s.branch || ''],
           ['Ifsc Code', s.ifsc || '']
         ];
+        const valMaxW = splitX - 2 - (X0 + 22);
         bankRows.forEach((r, i) => {
           const by = ry + 9 + i * 4;
           font(true, 7.5);
           text(r[0].toUpperCase(), X0 + 1.5, by);
-          text(': ' + String(r[1]).toUpperCase(), X0 + 22, by);
+          const val = ': ' + String(r[1]).toUpperCase();
+          let fs = 7.5;
+          while (fs > 5.5 && doc.getTextWidth(val) > valMaxW) { fs -= 0.5; font(true, fs); }
+          text(val, X0 + 22, by);
         });
+        if (hasQr) {
+          try {
+            const QR_SIZE = Math.min(midW - 3, BOTTOM_H - 6.5);
+            let qw = QR_SIZE, qh = QR_SIZE;
+            if (H.qrW && H.qrH) {
+              const r = H.qrW / H.qrH;
+              if (r > 1) qh = QR_SIZE / r; else qw = QR_SIZE * r;
+            }
+            const cx = splitX + midW / 2;
+            const top = ry + 1.2;
+            doc.addImage(H.qrDataUrl, 'PNG', cx - qw / 2, top + (QR_SIZE - qh) / 2, qw, qh, undefined, 'FAST');
+            font(true, 6.5);
+            text('Scan to Pay', cx, top + QR_SIZE + 3.3, { align: 'center' });
+          } catch (e) { /* skip QR */ }
+        }
+
         let dy = ry + bankH + 3.6;
         font(true, 7.5);
         text('Declaration', X0 + 1.5, dy); dy += 3.2;
         font(false, 6.6);
-        wrap('We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.', 96).forEach(l => { text(l, X0 + 1.5, dy); dy += 2.7; });
+        wrap('We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.', leftW - 4).forEach(l => { text(l, X0 + 1.5, dy); dy += 2.7; });
         const terms = String(inv.notes || s.terms || '1. Goods once sold will not be taken back.\n2. Please inspect goods at the time of delivery.\n3. Subject to local jurisdiction only.')
           .split('\n').map(t => t.trim()).filter(Boolean);
-        terms.forEach(t => wrap(t, 96).forEach(l => { if (dy < SHEET_BOTTOM - 1) { text(l, X0 + 1.5, dy); dy += 2.7; } }));
+        terms.forEach(t => wrap(t, leftW - 4).forEach(l => { if (dy < SHEET_BOTTOM - 1) { text(l, X0 + 1.5, dy); dy += 2.7; } }));
 
         font(false, 8);
         const forTxt = 'for ';
@@ -3790,7 +3907,11 @@
         const availBottom = SHEET_BOTTOM - 5;
         let y = yStart, taken = 0;
         while (taken < remaining.length && y + remaining[taken].h <= availBottom) { y += remaining[taken].h; taken++; }
-        if (taken >= remaining.length) taken = remaining.length - 1;
+        // never leave the tax/round-off rows alone on the next page: they travel with at least one item
+        let trailingTax = 0;
+        for (let k = remaining.length - 1; k >= 0 && remaining[k].kind === 'tax'; k--) trailingTax++;
+        const maxTaken = Math.max(1, remaining.length - (trailingTax + 1));
+        if (taken > maxTaken) taken = maxTaken;
         if (taken < 1) taken = 1;
         y = yStart;
         remaining.slice(0, taken).forEach(r => { drawRow(r, y); y += r.h; });
@@ -3805,22 +3926,23 @@
       return doc.output('blob');
     }
 
-
-
     /** Build the invoice as a real text PDF (selectable and copyable text). */
     async function createInvoicePdfBlob(inv) {
       const pdfAvailable = await loadHtml2Pdf();
       if (!pdfAvailable) throw new Error('PDF generator unavailable. Check your internet connection and try again.');
 
       const fileName = getInvoiceFileName(inv);
-      const s = inv.supplierSnapshot || db.settings;
-      const [fonts, logo] = await Promise.all([
+      const s = invoiceSupplier(inv);
+      const [fonts, logo, qr] = await Promise.all([
         loadPdfFonts(),
-        prepareLogoForPdf((s && s.logo) || (db.settings && db.settings.logo) || '')
+        prepareLogoForPdf((s && s.logo) || ''),
+        prepareLogoForPdf((s && s.qr) || '', true)
       ]);
       const blob = await buildInvoiceTextPdf(inv, s, {
         jsPDF: window.jspdf.jsPDF,
         num, round2, moneyRaw, titleCase, fmtTallyDate, codeFor, numberWordsINR,
+        supplierAddressLines, supplierContactLine,
+        qrDataUrl: qr.logoDataUrl, qrW: qr.logoW, qrH: qr.logoH,
         ...fonts, ...logo
       });
       if (!(blob instanceof Blob) || blob.size === 0) throw new Error('The generated PDF was empty.');
@@ -4204,6 +4326,13 @@
           render();
           notify('Logo removed.');
           break;
+
+        case 'remove-qr':
+          db.settings.qr = '';
+          saveDB();
+          render();
+          notify('QR code removed.');
+          break;
       }
     }
 
@@ -4553,6 +4682,25 @@
             saveDB();
             render();
             notify('Logo uploaded.');
+          };
+          reader.readAsDataURL(file);
+        });
+
+        // QR Code Upload
+        document.getElementById('qr-file')?.addEventListener('change', e => {
+          const file = e.target.files[0];
+          if (!file) return;
+          if (file.size > 500000) {
+            notify('QR code image must be under 500 KB.');
+            e.target.value = '';
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () => {
+            db.settings.qr = reader.result;
+            saveDB();
+            render();
+            notify('QR code uploaded.');
           };
           reader.readAsDataURL(file);
         });
