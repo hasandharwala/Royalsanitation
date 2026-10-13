@@ -1635,7 +1635,7 @@
           ` : ''}
           ${otherCharges > 0 ? `
             <div class="totalrow">
-              <span>Other Charges</span>
+              <span>Cartage &amp; Forwarding</span>
               <strong>+ ${money(otherCharges)}</strong>
             </div>
           ` : ''}
@@ -2089,7 +2089,7 @@
                   </select>
                 </div>
                 <div class="field">
-                  <label>Other Charges / Freight (₹)</label>
+                  <label>Cartage &amp; Forwarding (₹)</label>
                   <input type="number" min="0" step="0.01" id="other-charges" value="${num(v.otherCharges)}">
                 </div>
                 <div class="field">
@@ -2823,7 +2823,7 @@
     .items-tbl td {
       border-right: 1px solid #000;
       border-bottom: none;
-      padding: 1.5px 4px;
+      padding: 1px 4px;
       font-size: 10.5px;
       font-weight: 400;
       vertical-align: top;
@@ -3171,6 +3171,32 @@
             </tr>
           `}
 
+          ${(inv.discountMode === 'after' && num(inv.discount) > 0) ? `
+            <tr class="tax-row">
+              <td></td>
+              <td style="text-align:right;font-style:italic;font-weight:400;padding-right:16px;">Discount</td>
+              <td></td>
+              <td></td>
+              <td></td>
+              <td></td>
+              <td></td>
+              <td style="text-align:right;font-weight:400;">-${moneyRaw(inv.discount)}</td>
+            </tr>
+          ` : ''}
+
+          ${num(inv.otherCharges) > 0 ? `
+            <tr class="tax-row">
+              <td></td>
+              <td style="text-align:right;font-style:italic;font-weight:400;padding-right:16px;">Cartage &amp; Forwarding</td>
+              <td></td>
+              <td></td>
+              <td></td>
+              <td></td>
+              <td></td>
+              <td style="text-align:right;font-weight:400;">${moneyRaw(inv.otherCharges)}</td>
+            </tr>
+          ` : ''}
+
           ${num(inv.roundOff) !== 0 ? `
             <tr class="tax-row">
               <td></td>
@@ -3437,11 +3463,10 @@
       };
       try {
         const base = 'https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter@0.2.3/';
-        const [r, b] = await Promise.all([
-          fetch(base + 'Inter_400Regular.ttf').then(x => { if (!x.ok) throw new Error('font'); return x.arrayBuffer(); }),
-          fetch(base + 'Inter_700Bold.ttf').then(x => { if (!x.ok) throw new Error('font'); return x.arrayBuffer(); })
-        ]);
+        const get = f => fetch(base + f).then(x => { if (!x.ok) throw new Error('font'); return x.arrayBuffer(); });
+        const [r, b] = await Promise.all([get('Inter_400Regular.ttf'), get('Inter_700Bold.ttf')]);
         _pdfFontCache = { fontRegularB64: toB64(r), fontBoldB64: toB64(b) };
+        try { _pdfFontCache.fontSemiB64 = toB64(await get('Inter_600SemiBold.ttf')); } catch (e) { /* optional weight */ }
       } catch (err) {
         console.warn('Invoice font unavailable; using the built-in PDF font.', err);
         return {};
@@ -3470,20 +3495,28 @@
       });
     }
 
-    /* Draws the GST tax invoice as a real text PDF (selectable / copyable text) with jsPDF. */
+    /* Draws the GST tax invoice as a real text PDF (selectable / copyable text) with jsPDF.
+       Sizes follow the print layout (CSS px x 0.75 = pt) so the PDF looks like the print preview. */
     async function buildInvoiceTextPdf(inv, s, H) {
       const { jsPDF, num, round2, moneyRaw, titleCase, fmtTallyDate, codeFor, numberWordsINR, supplierAddressLines, supplierContactLine } = H;
       const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
 
-      // ---- fonts: Inter when available (has the rupee sign), otherwise built-in Helvetica ----
+      // ---- fonts: Inter (same family as the print layout; has the rupee sign), otherwise built-in Helvetica ----
       let FONT = 'helvetica';
       let RS = 'Rs. ';
+      const FACE = { r: 'Inter', s: 'InterSemi', b: 'InterBold' };
       if (H.fontRegularB64 && H.fontBoldB64) {
         try {
           doc.addFileToVFS('Inter-Regular.ttf', H.fontRegularB64);
           doc.addFont('Inter-Regular.ttf', 'Inter', 'normal', 400, 'Identity-H');
           doc.addFileToVFS('Inter-Bold.ttf', H.fontBoldB64);
           doc.addFont('Inter-Bold.ttf', 'InterBold', 'normal', 400, 'Identity-H');
+          if (H.fontSemiB64) {
+            doc.addFileToVFS('Inter-SemiBold.ttf', H.fontSemiB64);
+            doc.addFont('Inter-SemiBold.ttf', 'InterSemi', 'normal', 400, 'Identity-H');
+          } else {
+            FACE.s = 'InterBold';
+          }
           FONT = 'Inter';
           RS = '₹';
         } catch (e) { FONT = 'helvetica'; RS = 'Rs. '; }
@@ -3494,13 +3527,19 @@
       doc.setDrawColor(0);
       doc.setTextColor(0);
 
-      const font = (bold, size) => {
-        if (FONT === 'Inter') doc.setFont(bold ? 'InterBold' : 'Inter', 'normal'); else doc.setFont('helvetica', bold ? 'bold' : 'normal');
+      // weight: 'r' regular, 's' semibold (600), 'b' bold (700); true/false still accepted
+      const font = (w, size) => {
+        const k = w === true ? 'b' : (w === false || w === undefined) ? 'r' : w;
+        if (FONT === 'Inter') doc.setFont(FACE[k] || 'Inter', 'normal');
+        else doc.setFont('helvetica', (k === 'b' || k === 's') ? 'bold' : 'normal');
         doc.setFontSize(size);
       };
       const text = (str, x, y, o = {}) => doc.text(String(str ?? ''), x, y, o);
       const ln = (x1, y1, x2, y2) => doc.line(x1, y1, x2, y2);
       const wrap = (str, w) => doc.splitTextToSize(String(str ?? ''), w);
+      const PT = 0.3528;
+      /** baseline for text of size `pt` vertically centred in a line box starting at `top` with height `lh` (mm) */
+      const base = (top, lh, pt) => top + lh / 2 + 0.36 * pt * PT;
 
       // ---- geometry (mm) ----
       const X0 = 7, W = 196, X1 = X0 + W;
@@ -3508,24 +3547,27 @@
       const LEFT_W = 100;
       const SUP_TEXT_X = X0 + 27;
       const SUP_TEXT_W = (X0 + LEFT_W) - SUP_TEXT_X - 2;
+      const SZ = { name: 14.25, sup: 9.4, buyerName: 12, buyerLine: 10.5, buyerState: 9 };
+      const LH = { name: 5.8, sup: 4.0 };
       // supplier block lines (name, contact, full address, GSTIN, state) decide how tall the top block is
-      font(true, 14);
+      font('b', SZ.name);
       const supNameLines = wrap(String(s.businessName || 'ROYAL SANITATION').toUpperCase(), SUP_TEXT_W).slice(0, 2);
-      font(false, 9);
+      font('s', SZ.sup);
       const supContact = supplierContactLine ? supplierContactLine(s) : '';
       const supContactLines = supContact ? wrap(supContact, SUP_TEXT_W).slice(0, 2) : [];
-      font(true, 9);
+      font('b', SZ.sup);
       const supAddrLines = (supplierAddressLines ? supplierAddressLines(s) : []).flatMap(l => wrap(l, SUP_TEXT_W)).slice(0, 6);
-      const SUP_NEED = 6.5 + supNameLines.length * 5.2 + supContactLines.length * 4 + supAddrLines.length * 4 + 4 + 4 + 3;
-      const SUP_H = Math.max(26, SUP_NEED);
-      const BUYER_H = 26;
+      const SUP_CONTENT_H = supNameLines.length * LH.name + (supContactLines.length + supAddrLines.length + 2) * LH.sup;
+      const SUP_H = Math.max(24, SUP_CONTENT_H + 4);
+      const BUYER_H = 25.5;
       const TOP_H = SUP_H + BUYER_H;   // supplier/buyer + meta block
-      const HEAD_H = 9;            // items table header
-      const TOTAL_H = 5.5;         // items "Total" row
-      const TAX_ROW_H = 4.2;
-      const WORDS_H = 10;
-      const BOTTOM_H = 45;
-      const TAXWORDS_H = 6;
+      const HEAD_H = 8.4;          // items table header
+      const ITEM_H = 4.65;         // one item row
+      const TOTAL_H = 5.0;         // items "Total" row
+      const TAX_ROW_H = 4.0;
+      const WORDS_H = 7.6;
+      const BOTTOM_H = 46;
+      const TAXWORDS_H = 4.4;
 
       const placeOfSupply = inv.state || inv.placeOfSupply || 'Maharashtra';
       const isIntra = placeOfSupply === 'Madhya Pradesh';
@@ -3539,9 +3581,10 @@
 
       // ---- build row list ----
       const rows = [];
+      font('b', 9);
       items.forEach((it, idx) => {
         const lines = wrap(titleCase(it.description), DESC_W);
-        rows.push({ kind: 'item', it, idx, lines, h: Math.max(4.5, lines.length * 3.5 + 1.0) });
+        rows.push({ kind: 'item', it, idx, lines, h: Math.max(ITEM_H, lines.length * 3.7 + 1.0) });
       });
       const gstRate = num((items[0] && items[0].gstRate) || 18);
       if (!isIntra) {
@@ -3549,6 +3592,12 @@
       } else {
         rows.push({ kind: 'tax', label: 'CGST', rate: (gstRate / 2) + ' %', amt: moneyRaw(inv.cgst), h: TAX_ROW_H });
         rows.push({ kind: 'tax', label: 'SGST', rate: (gstRate / 2) + ' %', amt: moneyRaw(inv.sgst), h: TAX_ROW_H });
+      }
+      if (inv.discountMode === 'after' && num(inv.discount) > 0) {
+        rows.push({ kind: 'tax', label: 'Discount', rate: '', amt: '-' + moneyRaw(inv.discount), h: TAX_ROW_H });
+      }
+      if (num(inv.otherCharges) > 0) {
+        rows.push({ kind: 'tax', label: 'Cartage & Forwarding', rate: '', amt: moneyRaw(inv.otherCharges), h: TAX_ROW_H });
       }
       if (num(inv.roundOff) !== 0) {
         rows.push({ kind: 'tax', label: 'Round Off', rate: '', amt: (inv.roundOff >= 0 ? '+' : '') + moneyRaw(inv.roundOff), h: TAX_ROW_H });
@@ -3566,22 +3615,22 @@
         hsnMap[code].totalTax += num(it.gst);
       });
       const hsnList = Object.values(hsnMap);
-      const HSN_ROW_H = 4.8;
-      const HSN_HEAD_H = 9;
+      const HSN_ROW_H = 4.5;
+      const HSN_HEAD_H = 7.0;
       const hsnTableH = HSN_HEAD_H + HSN_ROW_H * (hsnList.length + 1);
       const TAIL_H = WORDS_H + hsnTableH + TAXWORDS_H + BOTTOM_H;
 
       // ---- drawing helpers ----
       function drawFrame(top, title) {
-        font(true, 15);
-        text(title, 105, 9.5, { align: 'center' });
+        font('b', 16.5);
+        text(title, 105, 9.6, { align: 'center' });
         doc.rect(X0, top, W, SHEET_BOTTOM - top);
-        font(false, 7);
-        text('This is a Computer Generated Invoice', 105, SHEET_BOTTOM + 4.2, { align: 'center' });
+        font('r', 6.75);
+        text('This is a Computer Generated Invoice', 105, SHEET_BOTTOM + 3.8, { align: 'center' });
       }
 
       function drawTopSection() {
-        const leftW = 100;
+        const leftW = LEFT_W;
         const splitX = X0 + leftW;
         const midY = SHEET_TOP + SUP_H;
         const botY = SHEET_TOP + TOP_H;
@@ -3589,51 +3638,52 @@
         ln(X0, midY, splitX, midY);
         ln(X0, botY, X1, botY);
 
-        // supplier block with logo
-        let textX = SUP_TEXT_X;
+        // supplier block with logo (logo centred vertically like the print layout)
+        const textX = SUP_TEXT_X;
+        const logoBox = 22;
+        const logoTop = SHEET_TOP + (SUP_H - logoBox) / 2;
         if (H.logoDataUrl) {
           try {
-            const bw = 22, bh = 22;
-            let w = bw, h = bh;
+            let w = logoBox, h = logoBox;
             if (H.logoW && H.logoH) {
               const r = H.logoW / H.logoH;
-              if (r > 1) h = bw / r; else w = bh * r;
+              if (r > 1) h = logoBox / r; else w = logoBox * r;
             }
-            doc.addImage(H.logoDataUrl, 'PNG', X0 + 2 + (bw - w) / 2, SHEET_TOP + 2 + (bh - h) / 2, w, h, undefined, 'FAST');
+            doc.addImage(H.logoDataUrl, 'PNG', X0 + 3 + (logoBox - w) / 2, logoTop + (logoBox - h) / 2, w, h, undefined, 'FAST');
           } catch (e) { /* skip logo */ }
         } else {
           doc.setLineDashPattern([0.8, 0.8], 0);
-          doc.rect(X0 + 2, SHEET_TOP + 2, 22, 22);
+          doc.rect(X0 + 3, logoTop, logoBox, logoBox);
           doc.setLineDashPattern([], 0);
-          font(true, 6.5);
-          text('LOGO', X0 + 13, SHEET_TOP + 12.5, { align: 'center' });
+          font('b', 6.5);
+          text('LOGO', X0 + 3 + logoBox / 2, logoTop + logoBox / 2 + 1, { align: 'center' });
         }
-        let y = SHEET_TOP + 6.5;
-        font(true, 14);
-        supNameLines.forEach(l => { text(l, textX, y); y += 5.2; });
+        let top = SHEET_TOP + (SUP_H - SUP_CONTENT_H) / 2;
+        font('b', SZ.name);
+        supNameLines.forEach(l => { text(l, textX, base(top, LH.name, SZ.name)); top += LH.name; });
         if (supContactLines.length) {
-          font(false, 9);
-          supContactLines.forEach(l => { text(l, textX, y); y += 4; });
+          font('s', SZ.sup);
+          supContactLines.forEach(l => { text(l, textX, base(top, LH.sup, SZ.sup)); top += LH.sup; });
         }
-        font(true, 9);
-        supAddrLines.forEach(l => { text(l, textX, y); y += 4; });
-        text('GSTIN/UIN: ' + (s.gstin || '23CHLPD7073A1ZQ'), textX, y); y += 4;
-        font(false, 9);
-        text('State Name : ' + titleCase(s.state || 'Madhya Pradesh') + ', Code : ' + (codeFor(s.state) || '23'), textX, y);
+        font('b', SZ.sup);
+        supAddrLines.forEach(l => { text(l, textX, base(top, LH.sup, SZ.sup)); top += LH.sup; });
+        text('GSTIN/UIN: ' + (s.gstin || '23CHLPD7073A1ZQ'), textX, base(top, LH.sup, SZ.sup)); top += LH.sup;
+        font('r', SZ.sup);
+        text('State Name : ' + titleCase(s.state || 'Madhya Pradesh') + ', Code : ' + (codeFor(s.state) || '23'), textX, base(top, LH.sup, SZ.sup));
 
         // buyer block
         const bx = X0 + 3;
-        let by = midY + 4;
-        font(true, 7.5);
-        text('Buyer (Bill to)', bx, by); by += 4.8;
-        font(true, 11);
-        wrap(titleCase(inv.partyName || '—'), leftW - 6).slice(0, 2).forEach(l => { text(l, bx, by); by += 4.8; });
-        font(true, 9);
+        let by = midY + 1.6;
+        font('b', 8.25);
+        text('Buyer (Bill to)', bx, base(by, 3.6, 8.25)); by += 4.0;
+        font('b', SZ.buyerName);
+        wrap(titleCase(inv.partyName || '—'), leftW - 6).slice(0, 2).forEach(l => { text(l, bx, base(by, 5.4, SZ.buyerName)); by += 5.4; });
+        font('b', SZ.buyerLine);
         const baddr = titleCase(inv.address || inv.city || '');
-        if (baddr) wrap(baddr, leftW - 6).slice(0, 2).forEach(l => { text(l, bx, by); by += 4; });
-        text('GSTIN/UIN : ' + (inv.gstin || '—'), bx, by); by += 4;
-        font(false, 8);
-        text('State Name : ' + titleCase(inv.state || '—') + ', Code : ' + (inv.stateCode || codeFor(inv.state) || '—'), bx, by);
+        if (baddr) wrap(baddr, leftW - 6).slice(0, 2).forEach(l => { text(l, bx, base(by, 4.6, SZ.buyerLine)); by += 4.6; });
+        text('GSTIN/UIN : ' + (inv.gstin || '—'), bx, base(by, 4.6, SZ.buyerLine)); by += 4.6;
+        font('r', SZ.buyerState);
+        text('State Name : ' + titleCase(inv.state || '—') + ', Code : ' + (inv.stateCode || codeFor(inv.state) || '—'), bx, base(by, 4.0, SZ.buyerState));
 
         // right meta grid
         const mx0 = splitX, mw = X1 - splitX, cw = mw / 2, rh = TOP_H / 6;
@@ -3649,22 +3699,22 @@
         cells.forEach((c, i) => {
           const ry = SHEET_TOP + i * rh;
           if (i > 0) ln(mx0, ry, X1, ry);
-          font(true, 6.8);
-          text(c[0], mx0 + 1.5, ry + 3.4);
-          text(c[2], mx0 + cw + 1.5, ry + 3.4);
-          font(true, 8);
-          if (c[1]) text(c[1], mx0 + 1.5, ry + 7.3);
-          if (c[3]) text(c[3], mx0 + cw + 1.5, ry + 7.3);
+          font('b', 7.5);
+          text(c[0], mx0 + 1.2, base(ry + 0.7, 3.2, 7.5));
+          text(c[2], mx0 + cw + 1.2, base(ry + 0.7, 3.2, 7.5));
+          font('b', 7.9);
+          if (c[1]) text(c[1], mx0 + 1.2, base(ry + 3.9, 3.3, 7.9));
+          if (c[3]) text(c[3], mx0 + cw + 1.2, base(ry + 3.9, 3.3, 7.9));
         });
       }
 
       function drawItemsHeader(y) {
         ln(X0, y, X1, y);
         ln(X0, y + HEAD_H, X1, y + HEAD_H);
-        font(true, 7.5);
-        const cy = y + 5.3;
-        text('Sl', colX[0] + colW[0] / 2, y + 3.6, { align: 'center' });
-        text('No.', colX[0] + colW[0] / 2, y + 7.2, { align: 'center' });
+        font('b', 7.9);
+        const cy = base(y, HEAD_H, 7.9);
+        text('Sl', colX[0] + colW[0] / 2, base(y + 0.8, 3.35, 7.9), { align: 'center' });
+        text('No.', colX[0] + colW[0] / 2, base(y + 0.8 + 3.35, 3.35, 7.9), { align: 'center' });
         text('Description of Goods', colX[1] + colW[1] / 2, cy, { align: 'center' });
         text('HSN/SAC', colX[2] + colW[2] / 2, cy, { align: 'center' });
         text('Quantity', colX[3] + colW[3] / 2, cy, { align: 'center' });
@@ -3682,13 +3732,14 @@
       function drawRow(r, y) {
         if (r.kind === 'item') {
           const it = r.it;
-          const ty = y + 3.5;
-          font(false, 7.5);
+          const ty = base(y, ITEM_H, 9);
+          font('r', 7.9);
           text(String(r.idx + 1), colX[0] + colW[0] / 2, ty, { align: 'center' });
-          font(true, 8);
-          r.lines.forEach((l, k) => text(l, colX[1] + 1.5, ty + k * 3.5));
-          font(false, 7.5);
+          font('b', 9);
+          r.lines.forEach((l, k) => text(l, colX[1] + 1.5, ty + k * 3.7));
+          font('r', 7.9);
           text(it.hsn || '—', colX[2] + colW[2] / 2, ty, { align: 'center' });
+          font('s', 9);
           const unit = titleCase(it.unit || 'pcs');
           text(num(it.qty).toFixed(2) + ' ' + unit, colX[4] - 1.5, ty, { align: 'right' });
           text(moneyRaw(it.rate), colX[5] - 1.5, ty, { align: 'right' });
@@ -3696,8 +3747,8 @@
           text(moneyRaw(it.gst), colX[7] - 1.5, ty, { align: 'right' });
           text(moneyRaw(it.taxable), colX[8] - 1.5, ty, { align: 'right' });
         } else {
-          const ty = y + 3.2;
-          font(false, 7.5);
+          const ty = base(y, TAX_ROW_H, 9);
+          font('r', 9);
           text(r.label, colX[2] - 3, ty, { align: 'right' });
           if (r.rate) text(r.rate, colX[5] + colW[5] / 2, ty, { align: 'center' });
           text(r.amt, colX[8] - 1.5, ty, { align: 'right' });
@@ -3708,91 +3759,93 @@
         ln(X0, y, X1, y);
         ln(X0, y + TOTAL_H, X1, y + TOTAL_H);
         const totalQty = items.reduce((sum, it) => sum + num(it.qty), 0);
-        font(true, 8);
-        text('Total', colX[2] - 3, y + 3.9, { align: 'right' });
-        text(totalQty.toFixed(2) + ' ' + (items[0] ? (items[0].unit || 'pcs') : 'pcs'), colX[4] - 1.5, y + 3.9, { align: 'right' });
-        text(moneyRaw(inv.totalGst), colX[7] - 1.5, y + 3.9, { align: 'right' });
-        font(true, 10);
-        text(RS + moneyRaw(inv.grandTotal), colX[8] - 1.5, y + 4.2, { align: 'right' });
+        font('s', 9);
+        const ty = base(y, TOTAL_H, 9);
+        text('Total', colX[2] - 3, ty, { align: 'right' });
+        text(totalQty.toFixed(2) + ' ' + (items[0] ? (items[0].unit || 'pcs') : 'pcs'), colX[4] - 1.5, ty, { align: 'right' });
+        text(moneyRaw(inv.totalGst), colX[7] - 1.5, ty, { align: 'right' });
+        font('b', 10.5);
+        text(RS + moneyRaw(inv.grandTotal), colX[8] - 1.5, base(y, TOTAL_H, 10.5), { align: 'right' });
       }
 
       function drawTail(y) {
         // amount in words
-        font(true, 6.8);
-        text('Amount Chargeable (in words)', X0 + 1.5, y + 3.3);
-        font(true, 8);
-        text(numberWordsINR(inv.grandTotal), X0 + 1.5, y + 7.4);
-        font(false, 7.5);
-        text('E. & O.E', X1 - 1.5, y + 3.3, { align: 'right' });
+        font('b', 7.5);
+        text('Amount Chargeable (in words)', X0 + 1.2, base(y + 0.4, 3.2, 7.5));
+        font('b', 7.9);
+        text(numberWordsINR(inv.grandTotal), X0 + 1.2, base(y + 3.6, 3.3, 7.9));
+        font('r', 7.9);
+        text('E. & O.E', X1 - 1.5, base(y + 0.4, 3.2, 7.9), { align: 'right' });
         y += WORDS_H;
         ln(X0, y, X1, y);
 
         // HSN / tax table
         const ty0 = y;
-        let widths, hdr;
+        let widths;
         if (!isIntra) widths = [56, 46, 22, 36, 36]; else widths = [40, 32, 14, 30, 14, 30, 36];
         const tx = [X0];
         widths.forEach((w, i) => tx.push(tx[i] + w));
         const half = HSN_HEAD_H / 2;
-        font(true, 7);
+        const hb = (row) => base(ty0 + row, half, 7.5);
+        font('b', 7.5);
         if (!isIntra) {
-          text('HSN/SAC', (tx[0] + tx[1]) / 2, ty0 + 5.3, { align: 'center' });
-          text('Taxable', (tx[1] + tx[2]) / 2, ty0 + 3.6, { align: 'center' });
-          text('Value', (tx[1] + tx[2]) / 2, ty0 + 7.2, { align: 'center' });
-          text('IGST', (tx[2] + tx[4]) / 2, ty0 + 3.3, { align: 'center' });
-          text('Rate', (tx[2] + tx[3]) / 2, ty0 + half + 3.3, { align: 'center' });
-          text('Amount', (tx[3] + tx[4]) / 2, ty0 + half + 3.3, { align: 'center' });
-          text('Total', (tx[4] + tx[5]) / 2, ty0 + 3.6, { align: 'center' });
-          text('Tax Amount', (tx[4] + tx[5]) / 2, ty0 + 7.2, { align: 'center' });
+          text('HSN/SAC', (tx[0] + tx[1]) / 2, base(ty0, HSN_HEAD_H, 7.5), { align: 'center' });
+          text('Taxable', (tx[1] + tx[2]) / 2, base(ty0 + 0.3, 3.2, 7.5), { align: 'center' });
+          text('Value', (tx[1] + tx[2]) / 2, base(ty0 + 3.5, 3.2, 7.5), { align: 'center' });
+          text('IGST', (tx[2] + tx[4]) / 2, hb(0), { align: 'center' });
+          text('Rate', (tx[2] + tx[3]) / 2, hb(half), { align: 'center' });
+          text('Amount', (tx[3] + tx[4]) / 2, hb(half), { align: 'center' });
+          text('Total', (tx[4] + tx[5]) / 2, base(ty0 + 0.3, 3.2, 7.5), { align: 'center' });
+          text('Tax Amount', (tx[4] + tx[5]) / 2, base(ty0 + 3.5, 3.2, 7.5), { align: 'center' });
           ln(tx[2], ty0 + half, tx[4], ty0 + half);
         } else {
-          text('HSN/SAC', (tx[0] + tx[1]) / 2, ty0 + 5.3, { align: 'center' });
-          text('Taxable', (tx[1] + tx[2]) / 2, ty0 + 3.6, { align: 'center' });
-          text('Value', (tx[1] + tx[2]) / 2, ty0 + 7.2, { align: 'center' });
-          text('Central Tax', (tx[2] + tx[4]) / 2, ty0 + 3.3, { align: 'center' });
-          text('State Tax', (tx[4] + tx[6]) / 2, ty0 + 3.3, { align: 'center' });
-          text('Rate', (tx[2] + tx[3]) / 2, ty0 + half + 3.3, { align: 'center' });
-          text('Amount', (tx[3] + tx[4]) / 2, ty0 + half + 3.3, { align: 'center' });
-          text('Rate', (tx[4] + tx[5]) / 2, ty0 + half + 3.3, { align: 'center' });
-          text('Amount', (tx[5] + tx[6]) / 2, ty0 + half + 3.3, { align: 'center' });
-          text('Total', (tx[6] + tx[7]) / 2, ty0 + 3.6, { align: 'center' });
-          text('Tax Amount', (tx[6] + tx[7]) / 2, ty0 + 7.2, { align: 'center' });
+          text('HSN/SAC', (tx[0] + tx[1]) / 2, base(ty0, HSN_HEAD_H, 7.5), { align: 'center' });
+          text('Taxable', (tx[1] + tx[2]) / 2, base(ty0 + 0.3, 3.2, 7.5), { align: 'center' });
+          text('Value', (tx[1] + tx[2]) / 2, base(ty0 + 3.5, 3.2, 7.5), { align: 'center' });
+          text('Central Tax', (tx[2] + tx[4]) / 2, hb(0), { align: 'center' });
+          text('State Tax', (tx[4] + tx[6]) / 2, hb(0), { align: 'center' });
+          text('Rate', (tx[2] + tx[3]) / 2, hb(half), { align: 'center' });
+          text('Amount', (tx[3] + tx[4]) / 2, hb(half), { align: 'center' });
+          text('Rate', (tx[4] + tx[5]) / 2, hb(half), { align: 'center' });
+          text('Amount', (tx[5] + tx[6]) / 2, hb(half), { align: 'center' });
+          text('Total', (tx[6] + tx[7]) / 2, base(ty0 + 0.3, 3.2, 7.5), { align: 'center' });
+          text('Tax Amount', (tx[6] + tx[7]) / 2, base(ty0 + 3.5, 3.2, 7.5), { align: 'center' });
           ln(tx[2], ty0 + half, tx[4], ty0 + half);
           ln(tx[4], ty0 + half, tx[6], ty0 + half);
         }
         ln(X0, ty0 + HSN_HEAD_H, X1, ty0 + HSN_HEAD_H);
 
         let ry = ty0 + HSN_HEAD_H;
-        font(true, 7.5);
+        font('s', 9);
         hsnList.forEach(h => {
-          const b = ry + 3.4;
-          text(h.hsn, tx[0] + 1.5, b);
-          text(moneyRaw(h.taxable), tx[2] - 1.5, b, { align: 'right' });
+          const b = base(ry, HSN_ROW_H, 9);
+          text(h.hsn, tx[0] + 1.2, b);
+          text(moneyRaw(h.taxable), tx[2] - 1.2, b, { align: 'right' });
           if (!isIntra) {
             text(num(h.gstRate) + '%', (tx[2] + tx[3]) / 2, b, { align: 'center' });
-            text(moneyRaw(h.igst || h.totalTax), tx[4] - 1.5, b, { align: 'right' });
-            text(moneyRaw(h.totalTax), tx[5] - 1.5, b, { align: 'right' });
+            text(moneyRaw(h.igst || h.totalTax), tx[4] - 1.2, b, { align: 'right' });
+            text(moneyRaw(h.totalTax), tx[5] - 1.2, b, { align: 'right' });
           } else {
             text((num(h.gstRate) / 2) + '%', (tx[2] + tx[3]) / 2, b, { align: 'center' });
-            text(moneyRaw(h.cgst), tx[4] - 1.5, b, { align: 'right' });
+            text(moneyRaw(h.cgst), tx[4] - 1.2, b, { align: 'right' });
             text((num(h.gstRate) / 2) + '%', (tx[4] + tx[5]) / 2, b, { align: 'center' });
-            text(moneyRaw(h.sgst), tx[6] - 1.5, b, { align: 'right' });
-            text(moneyRaw(h.totalTax), tx[7] - 1.5, b, { align: 'right' });
+            text(moneyRaw(h.sgst), tx[6] - 1.2, b, { align: 'right' });
+            text(moneyRaw(h.totalTax), tx[7] - 1.2, b, { align: 'right' });
           }
           ry += HSN_ROW_H;
           ln(X0, ry, X1, ry);
         });
         // total row
-        const b = ry + 3.4;
-        text('Total', tx[1] - 1.5, b, { align: 'right' });
-        text(moneyRaw(inv.taxable), tx[2] - 1.5, b, { align: 'right' });
+        const b = base(ry, HSN_ROW_H, 9);
+        text('Total', tx[1] - 1.2, b, { align: 'right' });
+        text(moneyRaw(inv.taxable), tx[2] - 1.2, b, { align: 'right' });
         if (!isIntra) {
-          text(moneyRaw(inv.totalGst), tx[4] - 1.5, b, { align: 'right' });
-          text(moneyRaw(inv.totalGst), tx[5] - 1.5, b, { align: 'right' });
+          text(moneyRaw(inv.totalGst), tx[4] - 1.2, b, { align: 'right' });
+          text(moneyRaw(inv.totalGst), tx[5] - 1.2, b, { align: 'right' });
         } else {
-          text(moneyRaw(inv.cgst), tx[4] - 1.5, b, { align: 'right' });
-          text(moneyRaw(inv.sgst), tx[6] - 1.5, b, { align: 'right' });
-          text(moneyRaw(inv.totalGst), tx[7] - 1.5, b, { align: 'right' });
+          text(moneyRaw(inv.cgst), tx[4] - 1.2, b, { align: 'right' });
+          text(moneyRaw(inv.sgst), tx[6] - 1.2, b, { align: 'right' });
+          text(moneyRaw(inv.totalGst), tx[7] - 1.2, b, { align: 'right' });
         }
         ry += HSN_ROW_H;
         ln(X0, ry, X1, ry);
@@ -3804,41 +3857,42 @@
         }
 
         // tax amount in words
-        font(false, 7.5);
-        text('Tax Amount (in words) : ', X0 + 1.5, ry + 4);
+        font('r', 7.9);
+        const twb = base(ry, TAXWORDS_H, 7.9);
+        text('Tax Amount (in words) : ', X0 + 1.2, twb);
         const lblW = doc.getTextWidth('Tax Amount (in words) : ');
-        font(true, 7.5);
-        text(numberWordsINR(inv.totalGst), X0 + 1.5 + lblW, ry + 4);
+        font('b', 7.9);
+        text(numberWordsINR(inv.totalGst), X0 + 1.2 + lblW, twb);
         ry += TAXWORDS_H;
         ln(X0, ry, X1, ry);
 
-        // bottom: bank + declaration | signatory
+        // bottom: bank + declaration | QR | signatory
         const hasQr = !!H.qrDataUrl;
-        // with a QR code the bottom splits in three: bank + terms | QR | signatory
         const leftW = hasQr ? 82 : 100;
         const midW = hasQr ? 44 : 0;
         const splitX = X0 + leftW;
         ln(splitX, ry, splitX, SHEET_BOTTOM);
         if (hasQr) ln(splitX + midW, ry, splitX + midW, SHEET_BOTTOM);
-        const bankH = 25;
+        const bankH = 25.5;
         ln(X0, ry + bankH, splitX, ry + bankH);
-        font(true, 8);
-        text("Company's Bank Details", X0 + 1.5, ry + 4.6);
+        font('s', 9);
+        text("COMPANY'S BANK DETAILS", X0 + 1.2, base(ry + 0.5, 3.8, 9));
         const bankRows = [
           ['Bank Name', s.bankName || ''],
           ['A/c No.', s.accountNumber || ''],
           ['Branch', s.branch || ''],
           ['Ifsc Code', s.ifsc || '']
         ];
-        const valMaxW = splitX - 2 - (X0 + 22);
+        const valMaxW = splitX - 2 - (X0 + 24);
         bankRows.forEach((r, i) => {
-          const by = ry + 9 + i * 4;
-          font(true, 7.5);
-          text(r[0].toUpperCase(), X0 + 1.5, by);
+          const by = base(ry + 4.6 + i * 4.8, 4.8, 9);
+          font('s', 9);
+          text(r[0].toUpperCase(), X0 + 1.2, by);
           const val = ': ' + String(r[1]).toUpperCase();
-          let fs = 7.5;
-          while (fs > 5.5 && doc.getTextWidth(val) > valMaxW) { fs -= 0.5; font(true, fs); }
-          text(val, X0 + 22, by);
+          let fs = 9;
+          font('b', fs);
+          while (fs > 6 && doc.getTextWidth(val) > valMaxW) { fs -= 0.5; font('b', fs); }
+          text(val, X0 + 24, by);
         });
         if (hasQr) {
           try {
@@ -3851,32 +3905,30 @@
             const cx = splitX + midW / 2;
             const top = ry + 1.2;
             doc.addImage(H.qrDataUrl, 'PNG', cx - qw / 2, top + (QR_SIZE - qh) / 2, qw, qh, undefined, 'FAST');
-            font(true, 6.5);
+            font('b', 6.75);
             text('Scan to Pay', cx, top + QR_SIZE + 3.3, { align: 'center' });
           } catch (e) { /* skip QR */ }
         }
 
-        let dy = ry + bankH + 3.6;
-        font(true, 7.5);
-        text('Declaration', X0 + 1.5, dy); dy += 3.2;
-        font(false, 6.6);
-        wrap('We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.', leftW - 4).forEach(l => { text(l, X0 + 1.5, dy); dy += 2.7; });
+        let dy = ry + bankH + 0.6;
+        font('b', 8.25);
+        text('Declaration', X0 + 1.2, base(dy, 3.5, 8.25)); dy += 3.5;
+        font('r', 7.1);
+        wrap('We declare that this invoice shows the actual price of the goods described and that all particulars are true and correct.', leftW - 3).forEach(l => { text(l, X0 + 1.2, base(dy, 3.0, 7.1)); dy += 3.0; });
         const terms = String(inv.notes || s.terms || '1. Goods once sold will not be taken back.\n2. Please inspect goods at the time of delivery.\n3. Subject to local jurisdiction only.')
           .split('\n').map(t => t.trim()).filter(Boolean);
-        terms.forEach(t => wrap(t, leftW - 4).forEach(l => { if (dy < SHEET_BOTTOM - 1) { text(l, X0 + 1.5, dy); dy += 2.7; } }));
+        terms.forEach(t => wrap(t, leftW - 3).forEach(l => { if (dy < SHEET_BOTTOM - 1.5) { text(l, X0 + 1.2, base(dy, 3.0, 7.1)); dy += 3.0; } }));
 
-        font(false, 8);
-        const forTxt = 'for ';
         const biz = String(s.businessName || 'ROYAL SANITATION');
-        font(true, 8);
+        font('b', 7.5);
         const bw = doc.getTextWidth(biz);
-        font(false, 8);
-        const fw = doc.getTextWidth(forTxt);
-        text(forTxt, X1 - 2 - bw - fw, ry + 4.5);
-        font(true, 8);
-        text(biz, X1 - 2, ry + 4.5, { align: 'right' });
-        font(false, 7.5);
-        text(s.signatory || 'Authorised Signatory', X1 - 2, SHEET_BOTTOM - 2.5, { align: 'right' });
+        font('r', 7.5);
+        const fw = doc.getTextWidth('for ');
+        text('for ', X1 - 2 - bw - fw, base(ry + 0.5, 3.4, 7.5));
+        font('b', 7.5);
+        text(biz, X1 - 2, base(ry + 0.5, 3.4, 7.5), { align: 'right' });
+        font('r', 7.5);
+        text(s.signatory || 'Authorised Signatory', X1 - 2, SHEET_BOTTOM - 2.3, { align: 'right' });
       }
 
       // ---- paginate ----
@@ -3916,7 +3968,7 @@
         y = yStart;
         remaining.slice(0, taken).forEach(r => { drawRow(r, y); y += r.h; });
         drawColumnLines(yStart, SHEET_BOTTOM);
-        font(false, 7);
+        font('r', 7);
         text('continued ...', X1 - 2, SHEET_BOTTOM - 1.5, { align: 'right' });
         remaining = remaining.slice(taken);
         page++;
@@ -4037,7 +4089,7 @@
         'Invoice Number', 'Date', 'Status', 'Party Name', 'GSTIN',
         'Billing Address', 'State', 'Place of Supply', 'Taxable Value',
         'CGST', 'SGST', 'IGST', 'Total GST', 'Discount',
-        'Other Charges', 'Round Off', 'Grand Total'
+        'Cartage & Forwarding', 'Round Off', 'Grand Total'
       ];
 
       const rows = db.invoices.map(i => [
