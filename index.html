@@ -895,6 +895,8 @@
         <button class="active" data-page="dashboard"><span class="ico">▦</span>Dashboard</button>
         <button data-page="create"><span class="ico">＋</span>Create Invoice</button>
         <button data-page="invoices"><span class="ico">▤</span>All Invoices</button>
+        <button data-page="create-challan"><span class="ico">＋</span>Create Challan</button>
+        <button data-page="challans"><span class="ico">▤</span>All Challans</button>
         <button data-page="parties"><span class="ico">♙</span>Customers / Parties</button>
         <button data-page="products"><span class="ico">▣</span>Products / Items</button>
         <button data-page="settings"><span class="ico">⚙</span>Business Settings</button>
@@ -1066,16 +1068,18 @@
         qr: ''
       },
       invoices: [],
+      challans: [],
       parties: [],
       products: [],
       // Tombstones: IDs of records deleted on any device, so a stale device can't resurrect them during sync.
-      deleted: { invoices: [], parties: [], products: [] },
-      seq: 329
+      deleted: { invoices: [], challans: [], parties: [], products: [] },
+      seq: 329,
+      challanSeq: 1
     };
 
     function normalizeDeleted(d) {
-      const out = { invoices: [], parties: [], products: [] };
-      ['invoices', 'parties', 'products'].forEach(k => {
+      const out = { invoices: [], challans: [], parties: [], products: [] };
+      ['invoices', 'challans', 'parties', 'products'].forEach(k => {
         out[k] = Array.isArray(d && d[k]) ? d[k].map(String) : [];
       });
       return out;
@@ -1097,6 +1101,7 @@
     let toastTimer = null;
     let modalResolver = null;
     let invoiceDraft = null;
+    let editingChallan = false;
 
     /** Load database from localStorage with schema fallback */
     function loadDB() {
@@ -1112,7 +1117,9 @@
             ...(data.settings || {})
           },
           deleted: normalizeDeleted(data.deleted),
-          seq: data.seq || data.settings?.nextNumber || 329
+          seq: data.seq || data.settings?.nextNumber || 329,
+          challans: Array.isArray(data.challans) ? data.challans : [],
+          challanSeq: Number(data.challanSeq || 1)
         };
       } catch (err) {
         console.error('Error loading database:', err);
@@ -1141,7 +1148,7 @@
         const sentDeleted = normalizeDeleted(db.deleted);
         await _cloudDoc.set(snapshot);
         // Deleted records are now truly gone from the database; drop the delete markers we just synced.
-        ['invoices', 'parties', 'products'].forEach(k => {
+        ['invoices', 'challans', 'parties', 'products'].forEach(k => {
           const sent = new Set(sentDeleted[k]);
           db.deleted[k] = (db.deleted[k] || []).filter(id => !sent.has(String(id)));
         });
@@ -1164,7 +1171,7 @@
     /** What gets stored in the cloud: all live data, with no delete markers, so deleted records leave no trace. */
     function cloudPayload() {
       const copy = JSON.parse(JSON.stringify(db));
-      copy.deleted = { invoices: [], parties: [], products: [] };
+      copy.deleted = { invoices: [], challans: [], parties: [], products: [] };
       return copy;
     }
 
@@ -1175,10 +1182,12 @@
         ...c,
         settings: { ...DEFAULTS.settings, ...(c.settings || {}) },
         invoices: Array.isArray(c.invoices) ? c.invoices : [],
+        challans: Array.isArray(c.challans) ? c.challans : [],
         parties: Array.isArray(c.parties) ? c.parties : [],
         products: Array.isArray(c.products) ? c.products : [],
         deleted: normalizeDeleted(),
-        seq: Number(c.seq || c.settings?.nextNumber || DEFAULTS.seq)
+        seq: Number(c.seq || c.settings?.nextNumber || DEFAULTS.seq),
+        challanSeq: Number(c.challanSeq || 1)
       };
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); } catch (e) {}
     }
@@ -1270,7 +1279,7 @@
             applyCloudData(cloudData);
             // One-time cleanup of old delete markers still stored in the cloud document.
             const old = normalizeDeleted(cloudData.deleted);
-            if (old.invoices.length || old.parties.length || old.products.length) {
+            if (old.invoices.length || old.challans.length || old.parties.length || old.products.length) {
               await _cloudDoc.set(cloudPayload());
             }
             _setSyncBadge('synced');
@@ -1284,7 +1293,7 @@
           const cloudDel = normalizeDeleted(cloudData.deleted);
           const localDel = normalizeDeleted(localData.deleted);
           const unionDel = {};
-          ['invoices', 'parties', 'products'].forEach(k => {
+          ['invoices', 'challans', 'parties', 'products'].forEach(k => {
             unionDel[k] = Array.from(new Set([...cloudDel[k], ...localDel[k]]));
           });
           db = {
@@ -1296,10 +1305,12 @@
               ...(localWins ? (localData.settings || {}) : {})
             },
             invoices: mergeRecords(cloudData.invoices, localData.invoices, localWins, unionDel.invoices),
+            challans: mergeRecords(cloudData.challans, localData.challans, localWins, unionDel.challans),
             parties: mergeRecords(cloudData.parties, localData.parties, localWins, unionDel.parties),
             products: mergeRecords(cloudData.products, localData.products, localWins, unionDel.products),
             deleted: unionDel,
-            seq: Math.max(cloudSeq, localSeq)
+            seq: Math.max(cloudSeq, localSeq),
+            challanSeq: Math.max(Number(cloudData.challanSeq || 1), Number(localData.challanSeq || 1))
           };
           localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
           const hasLocalOnly = (localRecords, cloudRecords, kind) => {
@@ -1307,9 +1318,10 @@
             const gone = new Set(unionDel[kind]);
             return (Array.isArray(localRecords) ? localRecords : []).some(x => x && x.id && !cloudIds.has(String(x.id)) && !gone.has(String(x.id)));
           };
-          const tombstonesChanged = ['invoices', 'parties', 'products'].some(k => unionDel[k].length !== cloudDel[k].length);
+          const tombstonesChanged = ['invoices', 'challans', 'parties', 'products'].some(k => unionDel[k].length !== cloudDel[k].length);
           const needsCloudWrite = localWins || tombstonesChanged ||
             hasLocalOnly(localData.invoices, cloudData.invoices, 'invoices') ||
+            hasLocalOnly(localData.challans, cloudData.challans, 'challans') ||
             hasLocalOnly(localData.parties, cloudData.parties, 'parties') ||
             hasLocalOnly(localData.products, cloudData.products, 'products') || localSeq > cloudSeq;
           if (needsCloudWrite) {
@@ -1438,6 +1450,11 @@
         return `${prefix ? prefix + '/' : ''}${fy}/${String(seqVal).padStart(4, '0')}`;
       }
       return `${prefix ? prefix + '/' : ''}${seqVal}`;
+    }
+
+    /** Challans have a deliberately independent sequence from tax invoices. */
+    function generateChallanNumber() {
+      return `CH-${String(Number(db.challanSeq || 1)).padStart(4, '0')}`;
     }
 
     /** Display temporary notification toast */
@@ -1725,6 +1742,8 @@
         dashboard: 'Dashboard',
         create: editingId ? 'Edit Invoice' : 'Create Invoice',
         invoices: 'All Invoices',
+        'create-challan': editingId ? 'Edit Challan' : 'Create Challan',
+        challans: editingId ? 'Edit Challan' : 'Delivery Challans',
         parties: 'Customers / Parties',
         products: 'Products / Items',
         settings: 'Business Settings'
@@ -1741,6 +1760,8 @@
         case 'dashboard': content.innerHTML = dashboardHTML(); break;
         case 'invoices':  content.innerHTML = invoicesHTML(); break;
         case 'create':    content.innerHTML = invoiceHTML(); break;
+        case 'challans':  content.innerHTML = challansListHTML(); break;
+        case 'create-challan': content.innerHTML = challansHTML(); break;
         case 'parties':   content.innerHTML = partiesHTML(); break;
         case 'products':  content.innerHTML = productsHTML(); break;
         case 'settings':  content.innerHTML = settingsHTML(); break;
@@ -1983,7 +2004,7 @@
               <div class="formgrid">
                 <div class="field">
                   <label>Invoice Number *</label>
-                  <input id="inv-number" value="${esc(v.number)}" required ${existingInv && existingInv.status === 'Issued' ? 'readonly' : ''}>
+                  <input id="inv-number" value="${esc(v.number)}" required autocomplete="off">
                 </div>
                 <div class="field">
                   <label>Invoice Date *</label>
@@ -2243,6 +2264,72 @@
         updatedAt: new Date().toISOString()
       };
     }
+
+    /* --- Delivery challans: a separate, non-GST document flow --- */
+    function challansListHTML() {
+      return `
+        <div class="pagehead"><div><h2>All Challans</h2><p class="sub">Filter, search, print, and manage delivery challans.</p></div><button class="primary" data-action="new-challan">＋ Create Challan</button></div>
+        <section class="panel"><div class="panelhead"><h3>Challan Register <span class="muted">(${(db.challans || []).length})</span></h3><div class="filters"><input id="challan-search" placeholder="Search challan, party, address…"><select id="challan-status-filter"><option value="">All Statuses</option><option value="Draft">Draft</option><option value="Issued">Issued</option></select><input type="date" id="challan-from-date" title="From Date"><input type="date" id="challan-to-date" title="To Date"></div></div><div id="challan-table-container">${challanTableBody(db.challans || [])}</div></section>`;
+    }
+
+    function challanRow(c) {
+      return `<tr><td><strong>${esc(c.number)}</strong></td><td>${esc(fmtDate(c.date))}</td><td><strong style="text-transform:capitalize;">${esc(titleCase(c.partyName || '—'))}</strong>${c.address ? `<div class="smalltext">${esc(c.address)}</div>` : ''}</td><td class="money">${money(c.taxable)}</td><td class="money">${money(c.grandTotal)}</td><td><span class="badge ${c.status === 'Draft' ? 'draft' : ''}">${esc(c.status || 'Issued')}</span></td><td><div class="actions"><button class="secondary small" data-action="preview-challan" data-id="${esc(c.id)}">View</button><button class="secondary small" data-action="edit-challan" data-id="${esc(c.id)}">Edit</button><button class="primary small" data-action="download-challan" data-id="${esc(c.id)}">Download</button><button class="secondary small" data-action="print-challan" data-id="${esc(c.id)}">Print</button><button class="danger small" data-action="delete-challan" data-id="${esc(c.id)}">×</button></div></td></tr>`;
+    }
+
+    function challanTableBody(list) {
+      if (!list.length) return `<div class="empty"><b>No matching challans</b><br>Try adjusting your search criteria or create a new challan.</div>`;
+      return `<div class="tablewrap"><table><thead><tr><th>Challan No.</th><th>Date</th><th>Party</th><th>Goods Value</th><th>Grand Total</th><th>Status</th><th>Actions</th></tr></thead><tbody>${list.map(challanRow).join('')}</tbody></table></div>`;
+    }
+
+    function challansHTML() {
+      const existing = editingId ? db.challans.find(c => c.id === editingId) : null;
+      const v = existing ? JSON.parse(JSON.stringify(existing)) : {
+        id: '', number: generateChallanNumber(), date: new Date().toISOString().slice(0, 10),
+        status: 'Issued', partyName: '', address: '', phone: '', items: [blankItem()],
+        discount: 0, otherCharges: 0, roundOff: 0
+      };
+      invoiceDraft = v;
+      return `
+        <div class="pagehead"><div><h2>${existing ? 'Edit Delivery Challan' : 'Create Delivery Challan'}</h2><p class="sub">A non-GST goods challan with its own numbering sequence.</p></div><button class="secondary" data-page="challans">← Back to Challans</button></div>
+        <form id="challan-form" data-dirty="0">
+          <section class="panel"><div class="panelhead"><h3>01 · Challan &amp; Customer Details</h3></div><div class="panelbody">
+            <div class="formgrid"><div class="field"><label>Challan Number *</label><input id="challan-number" value="${esc(v.number)}" required ${existing && existing.status === 'Issued' ? 'readonly' : ''}></div><div class="field"><label>Challan Date *</label><input type="date" id="challan-date" value="${esc(v.date)}" required></div><div class="field"><label>Status</label><select id="challan-status"><option value="Issued" ${v.status === 'Issued' ? 'selected' : ''}>Issued (Final)</option><option value="Draft" ${v.status === 'Draft' ? 'selected' : ''}>Draft</option></select></div></div>
+            <div class="divider"></div><h4 class="sectiontitle">Customer / Party Details</h4>
+            <div class="formgrid"><div class="field span2"><label>Party / Customer Name *</label><input id="challan-party-name" list="party-list" value="${esc(v.partyName)}" required autocomplete="off"><datalist id="party-list">${db.parties.map(p => `<option value="${esc(p.name)}">${esc(p.address || '')}</option>`).join('')}</datalist></div><div class="field"><label>Phone / WhatsApp</label><input id="challan-phone" value="${esc(v.phone)}"></div><div class="field span2"><label>Delivery Address</label><input id="challan-address" value="${esc(v.address)}" placeholder="Shop/House no, Street name, City"></div></div>
+          </div></section>
+          <section class="panel"><div class="panelhead"><h3>02 · Goods</h3><button type="button" class="secondary small" id="add-challan-item">＋ Add Item</button></div>
+            <datalist id="product-list">${db.products.map(p => `<option value="${esc(p.name)}">Rate: ₹${num(p.rate)}</option>`).join('')}</datalist>
+            <div class="tablewrap"><table class="items-table"><thead><tr><th style="width:36px">#</th><th>Item Description</th><th>Qty</th><th>Unit</th><th>Rate (₹)</th><th>Amount</th><th style="width:40px"></th></tr></thead><tbody id="challan-items-body"></tbody></table></div>
+            <div class="panelbody"><div class="formgrid"><div class="field"><label>Discount</label><input type="number" min="0" step="0.01" id="challan-discount" value="${num(v.discount)}"></div><div class="field"><label>Cartage &amp; Forwarding (₹)</label><input type="number" min="0" step="0.01" id="challan-other-charges" value="${num(v.otherCharges)}"></div><div class="field"><label>Round-off (₹)</label><input type="number" step="0.01" id="challan-round-off" value="${num(v.roundOff)}"></div></div><div class="totals"><div class="totalsbox" id="challan-totals-box"></div></div></div>
+            <div class="formactions"><div class="leftactions"><button type="button" class="secondary" data-page="challans">Cancel</button></div><div class="rightactions"><button type="button" class="secondary" id="preview-challan">Preview / Print</button><button type="submit" class="primary">${existing ? 'Save Changes' : 'Save Challan'}</button></div></div>
+          </section>
+        </form>`;
+    }
+
+    function calculateChallan() {
+      if (!invoiceDraft) return null;
+      const discount = Math.max(0, num(document.getElementById('challan-discount')?.value));
+      const gross = invoiceDraft.items.reduce((sum, it) => sum + num(it.qty) * num(it.rate), 0);
+      const factor = gross ? Math.max(0, (gross - Math.min(discount, gross)) / gross) : 1;
+      const items = invoiceDraft.items.map(it => ({ ...it, amount: round2(num(it.qty) * num(it.rate) * factor) }));
+      const subtotal = round2(items.reduce((sum, it) => sum + it.amount, 0));
+      const otherCharges = Math.max(0, num(document.getElementById('challan-other-charges')?.value));
+      const roundOff = num(document.getElementById('challan-round-off')?.value);
+      const grandTotal = round2(Math.max(0, subtotal + otherCharges + roundOff));
+      const box = document.getElementById('challan-totals-box');
+      if (box) box.innerHTML = `<div class="totalrow"><span>Goods Value</span><strong>${money(subtotal)}</strong></div>${discount ? `<div class="totalrow"><span>Discount</span><strong>− ${money(discount)}</strong></div>` : ''}${otherCharges ? `<div class="totalrow"><span>Cartage &amp; Forwarding</span><strong>+ ${money(otherCharges)}</strong></div>` : ''}<div class="totalrow"><span>Round-off Adjustment</span><strong>${roundOff >= 0 ? '+' : ''}${money(roundOff)}</strong></div><div class="totalrow grand"><span>Grand Total</span><strong>${money(grandTotal)}</strong></div>`;
+      return { items, subtotal, discount, otherCharges, roundOff, grandTotal };
+    }
+
+    function renderChallanItems() {
+      const body = document.getElementById('challan-items-body'); if (!body) return;
+      const units = ['pcs', 'Nos', 'Pcs', 'Kg', 'Gm', 'Ltr', 'Mtr', 'Box', 'Set', 'Pack', 'Service', 'Feet'];
+      body.innerHTML = invoiceDraft.items.map((it, idx) => `<tr data-item="${idx}"><td style="text-align:center;font-weight:700">${idx + 1}</td><td><input data-k="description" list="product-list" value="${esc(it.description)}" required></td><td><input data-k="qty" type="number" min="0.001" step="0.001" value="${num(it.qty)}" required></td><td><select data-k="unit">${units.map(u => `<option ${it.unit === u ? 'selected' : ''}>${u}</option>`).join('')}</select></td><td><input data-k="rate" type="number" min="0" step="0.01" value="${num(it.rate)}" required></td><td class="money challan-item-amount">—</td><td><button type="button" class="danger small" data-action="remove-challan-item" data-index="${idx}">×</button></td></tr>`).join('');
+      body.querySelectorAll('input,select').forEach(el => el.addEventListener('input', () => { const it = invoiceDraft.items[Number(el.closest('tr').dataset.item)]; it[el.dataset.k] = ['qty','rate'].includes(el.dataset.k) ? num(el.value) : el.value; document.getElementById('challan-form').dataset.dirty = '1'; refreshChallan(); }));
+      refreshChallan();
+    }
+    function refreshChallan() { const result = calculateChallan(); if (result) document.querySelectorAll('.challan-item-amount').forEach((el, i) => el.textContent = money(result.items[i]?.amount)); }
+    function getFormChallan() { const calc = calculateChallan() || {}; return { ...invoiceDraft, id: editingId || invoiceDraft.id || crypto.randomUUID(), number: document.getElementById('challan-number').value.trim(), date: document.getElementById('challan-date').value, status: document.getElementById('challan-status').value, partyName: titleCase(document.getElementById('challan-party-name').value.trim()), phone: document.getElementById('challan-phone').value.trim(), address: titleCase(document.getElementById('challan-address').value.trim()), items: calc.items || [], taxable: calc.subtotal || 0, discount: calc.discount || 0, otherCharges: calc.otherCharges || 0, roundOff: calc.roundOff || 0, grandTotal: calc.grandTotal || 0, supplierSnapshot: { ...db.settings } }; }
 
     /* --- View 4: Customers / Parties --- */
     function partiesHTML() {
@@ -3438,6 +3525,152 @@
       }, 350);
     }
 
+    /** Non-GST print layout: it deliberately omits GST, bank and payment QR sections. */
+    function generateChallanHtml(challan) {
+      const s = invoiceSupplier(challan), items = (challan.items || []).map(it => ({ ...it, hsn: '' }));
+      const address = supplierAddressLines(s).join(', '), totalQty = items.reduce((n, it) => n + num(it.qty), 0);
+      return `<!doctype html><html><head><meta charset="utf-8"><title>Challan ${esc(challan.number)}</title><link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"><style>
+        *{box-sizing:border-box} body{font-family:Arial,Helvetica,sans-serif;color:#111;margin:0;font-size:10px;line-height:1.18}.sheet{width:200mm;height:282mm;margin:4mm auto;border:.35mm solid #555;display:flex;flex-direction:column}.title{text-align:center;font-size:15px;font-weight:700;letter-spacing:.15px;padding:2mm 0 1.5mm;border-bottom:.25mm solid #777}.top{display:grid;grid-template-columns:37% 63%;border-bottom:.25mm solid #777;min-height:67mm}.left{border-right:.25mm solid #777;display:grid;grid-template-rows:18mm 49mm}.block{padding:2.3mm 2mm;border-bottom:.25mm solid #999;min-height:0}.block:last-child{border:0}.firm{font-size:13px;font-weight:700;text-transform:none;line-height:1.08}.muted{font-size:9px;color:#444}.meta{width:100%;height:100%;border-collapse:collapse}.meta td{width:50%;height:16.75mm;padding:2mm;border-bottom:.25mm solid #aaa;border-right:.25mm solid #aaa;vertical-align:top}.meta tr:last-child td{border-bottom:0}.meta td:last-child{border-right:0}.label{display:block;font-size:9px;color:#444;line-height:1.05}.goods{width:100%;border-collapse:collapse;font-size:10px}.goods th,.goods td{border-right:.25mm solid #777;border-bottom:.25mm solid #aaa;padding:1.1mm 1.5mm}.goods th:last-child,.goods td:last-child{border-right:0}.goods th{text-align:center;font-size:10px;font-weight:400;line-height:1.1}.goods td{line-height:1.1}.goods .fill td{height:62mm;border-bottom:0}.total td{border-top:.25mm solid #777;font-weight:700;padding:1.25mm 1.5mm}.words{border-top:.25mm solid #777;padding:1.6mm 2mm;min-height:15mm}.words b{display:block;margin-top:1.2mm;font-size:11px;letter-spacing:.1px}.bottom{margin-top:auto;display:grid;grid-template-columns:50% 50%;border-top:.25mm solid #777;min-height:25mm}.bottom>div{padding:2mm}.bottom>div:first-child{border-right:.25mm solid #777}.sign{text-align:right;display:flex;flex-direction:column;justify-content:space-between;font-weight:600}.foot{text-align:center;padding:1.5mm;border-top:.25mm solid #777;font-size:9px}@media print{body{margin:0}.sheet{margin:0;width:200mm;height:282mm}}
+      </style></head><body><div class="sheet"><div class="title">DELIVERY CHALLAN</div><div class="top"><div class="left"><div class="block"><div class="firm">${esc(s.businessName || 'ROYAL SANITATION')}</div>${address ? `<div>${esc(address)}</div>` : ''}${supplierContactLine(s) ? `<div>${esc(supplierContactLine(s))}</div>` : ''}</div><div class="block"><span class="muted">Consignee / Buyer</span><div class="firm" style="font-size:14px">${esc(challan.partyName || '—')}</div>${challan.address ? `<div>${esc(challan.address)}</div>` : ''}${challan.phone ? `<div>Phone: ${esc(challan.phone)}</div>` : ''}</div></div><div><table class="meta"><tr><td><span class="label">Challan No.</span><b>${esc(challan.number)}</b></td><td><span class="label">Dated</span><b>${esc(fmtTallyDate(challan.date))}</b></td></tr><tr><td><span class="label">Delivery Note</span>&nbsp;</td><td><span class="label">Mode/Terms of Payment</span>&nbsp;</td></tr><tr><td><span class="label">Buyer's Order No.</span>&nbsp;</td><td><span class="label">Dispatch Document No.</span>&nbsp;</td></tr><tr><td><span class="label">Dispatched through</span>&nbsp;</td><td><span class="label">Destination</span>&nbsp;</td></tr></table></div></div><table class="goods"><thead><tr><th style="width:7%">Sl.<br>No.</th><th>Description of Goods</th><th style="width:15%">Quantity</th><th style="width:15%">Rate</th><th style="width:18%">Amount</th></tr></thead><tbody>${items.map((it,i)=>`<tr><td style="text-align:center">${i+1}</td><td style="font-weight:700">${esc(titleCase(it.description))}${it.hsn ? `<div class="muted">HSN/SAC: ${esc(it.hsn)}</div>` : ''}</td><td style="text-align:right">${num(it.qty).toFixed(2)} ${esc(it.unit || 'pcs')}</td><td style="text-align:right">${moneyRaw(it.rate)}</td><td style="text-align:right">${moneyRaw(it.amount)}</td></tr>`).join('')}<tr class="fill"><td></td><td></td><td></td><td></td><td></td></tr></tbody><tfoot><tr class="total"><td></td><td style="text-align:right">Total</td><td style="text-align:right">${totalQty.toFixed(2)}</td><td></td><td style="text-align:right;font-size:14px">₹${moneyRaw(challan.grandTotal)}</td></tr></tfoot></table><div class="words"><span class="label">Amount Chargeable (in words)</span><b>${esc(numberWordsINR(challan.grandTotal))}</b></div><div class="bottom"><div><b>Declaration</b><br>We declare that this challan shows the actual goods described and all particulars are true and correct.</div><div class="sign"><div>for ${esc(s.businessName || 'ROYAL SANITATION')}</div><div>${esc(s.signatory || 'Authorised Signatory')}</div></div></div><div class="foot">This is a Computer Generated Challan</div></div></body></html>`;
+    }
+    /* The reference-style version keeps the original Tally grid proportions and labels. */
+    function generateReferenceChallanHtml(challan) {
+      const s = invoiceSupplier(challan);
+      const items = challan.items || [];
+      const totalQty = items.reduce((n, it) => n + num(it.qty), 0);
+      const address = supplierAddressLines(s).join(', ');
+      // Keep the ruled goods box tall; only a small blank space is left for the footer.
+      const adjustmentRows = (num(challan.otherCharges) ? 1 : 0) + (num(challan.roundOff) ? 1 : 0);
+      // Extra goods consume the former blank row space, keeping up to 18 goods plus charges on one A4 page.
+      const blankHeight = Math.max(2, 122 - (items.length + adjustmentRows) * 5.2);
+      const meta = [
+        ['Challan No.', challan.number, 'Dated', fmtTallyDate(challan.date)],
+        ['Delivery Note', '', 'Mode/Terms of Payment', ''],
+        ["Supplier's Ref.", '', 'Other Reference(s)', ''],
+        ["Buyer's Order No.", '', 'Dated', ''],
+        ['Dispatch Document No.', '', 'Dated', ''],
+        ['Dispatched through', '', 'Destination', ''],
+        ['Terms of Delivery', '', '', '']
+      ];
+      return `<!doctype html><html><head><meta charset="utf-8"><title>Challan ${esc(challan.number)}</title><style>
+        @page{size:A4;margin:0} *{box-sizing:border-box} html,body{margin:0;background:#fff;color:#111;font-family:Arial,Helvetica,sans-serif;font-size:15.5px;line-height:1.16}.page{width:200mm;height:282mm;margin:4mm auto;border:.25mm solid #777;display:flex;flex-direction:column}.doc-title{text-align:center;font-size:20.5px;font-weight:700;padding:2.2mm 0 1.7mm;border-bottom:.25mm solid #999}.head{height:67mm;display:grid;grid-template-columns:37% 63%;border-bottom:.25mm solid #999}.party{border-right:.25mm solid #999;display:grid;grid-template-rows:18mm 1fr}.party-box{padding:2.1mm;border-bottom:.25mm solid #aaa}.party-box:last-child{border:0}.party-label,.meta-label{font-size:14.5px;color:#444}.seller,.buyer{font-size:18.5px;font-weight:700;line-height:1.08}.buyer{margin-top:1mm}.meta{border-collapse:collapse;width:100%;height:100%}.meta td{padding:1.8mm 2mm;vertical-align:top;border-right:.25mm solid #aaa;border-bottom:.25mm solid #aaa;width:50%}.meta td:last-child{border-right:0}.meta tr:last-child td{border-bottom:0}.meta tr:last-child td:first-child{width:100%}.meta b{display:block;font-size:16.5px;margin-top:.4mm}.goods{width:100%;table-layout:fixed;border-collapse:collapse;font-size:15.5px}.goods th:nth-child(1),.goods td:nth-child(1){width:6%}.goods th:nth-child(2),.goods td:nth-child(2){width:44%}.goods th:nth-child(3),.goods td:nth-child(3){width:12%}.goods th:nth-child(4),.goods td:nth-child(4){width:12%}.goods th:nth-child(5),.goods td:nth-child(5){width:10%}.goods th:nth-child(6),.goods td:nth-child(6){width:16%}.goods th,.goods td{padding:1.1mm 1.5mm;border-right:.25mm solid #888;border-bottom:.25mm solid #aaa}.goods th:last-child,.goods td:last-child{border-right:0}.goods th{text-align:center;font-size:15.5px;font-weight:400}.goods td{line-height:1.1}.goods .desc{font-size:16.5px;font-weight:700}.blank td{height:${blankHeight}mm;border-bottom:0}.total td{padding:1.2mm 1.5mm;border-top:.25mm solid #777;font-weight:700}.total td:last-child{font-size:16.5px!important}.words{min-height:13mm;padding:1.7mm 2mm;border-top:.25mm solid #777}.words b{display:block;margin-top:1mm;font-size:16.5px;letter-spacing:.1px}.bottom{margin-top:0;min-height:26mm;display:grid;grid-template-columns:50% 50%;border-top:.25mm solid #777}.declaration,.sign{padding:2mm}.declaration{border-right:.25mm solid #777}.sign{font-weight:600;text-align:right;display:flex;flex-direction:column;justify-content:space-between}.footer{border-top:.25mm solid #777;padding:1.4mm;text-align:center;font-size:14.5px}@media print{.page{margin:4mm auto;width:200mm;height:282mm}}
+      </style></head><body><div class="page"><div class="doc-title">DELIVERY CHALLAN</div><div class="head"><div class="party"><div class="party-box"><div class="seller">${esc(s.businessName || 'ROYAL SANITATION')}</div>${address ? `<div>${esc(address)}</div>` : ''}${supplierContactLine(s) ? `<div>${esc(supplierContactLine(s))}</div>` : ''}</div><div class="party-box"><div class="party-label">Buyer</div><div class="buyer">${esc(challan.partyName || '—')}</div>${challan.address ? `<div>${esc(challan.address)}</div>` : ''}${challan.phone ? `<div>Phone: ${esc(challan.phone)}</div>` : ''}</div></div><table class="meta">${meta.map((r,i) => `<tr><td ${i === 6 ? 'colspan="2"' : ''}><span class="meta-label">${esc(r[0])}</span>${r[1] ? `<b>${esc(r[1])}</b>` : ''}</td>${i === 6 ? '' : `<td><span class="meta-label">${esc(r[2])}</span>${r[3] ? `<b>${esc(r[3])}</b>` : ''}</td>`}</tr>`).join('')}</table></div><table class="goods"><thead><tr><th style="width:6%">Sl<br>No.</th><th>Description of Goods</th><th style="width:16%">Quantity</th><th style="width:15%">Rate</th><th style="width:18%">per</th><th style="width:18%">Amount</th></tr></thead><tbody>${items.map((it,i) => `<tr><td style="text-align:center">${i + 1}</td><td class="desc">${esc(titleCase(it.description))}</td><td style="text-align:right">${num(it.qty).toFixed(2)}</td><td style="text-align:right">${moneyRaw(it.rate)}</td><td style="text-align:center">${esc(it.unit || 'pcs')}</td><td style="text-align:right">${moneyRaw(it.amount)}</td></tr>`).join('')}<tr class="blank"><td></td><td></td><td></td><td></td><td></td><td></td></tr></tbody><tfoot><tr class="total"><td></td><td style="text-align:right">Total</td><td style="text-align:right">${totalQty.toFixed(2)} ${esc(items[0]?.unit || 'pcs')}</td><td></td><td></td><td style="text-align:right;font-size:14px">${moneyRaw(challan.grandTotal)}</td></tr></tfoot></table><div class="words"><span class="meta-label">Amount Chargeable (in words)</span><b>${esc(numberWordsINR(challan.grandTotal))}</b></div><div class="bottom"><div class="declaration"><b>Declaration</b><br>We declare that this challan shows the actual goods described and that all particulars are true and correct.</div><div class="sign"><div>for ${esc(s.businessName || 'ROYAL SANITATION')}</div><div>${esc(s.signatory || 'Authorised Signatory')}</div></div></div><div class="footer">This is a Computer Generated Challan</div></div></body></html>`;
+    }
+    function challanPrintHtml(challan) {
+      const adjustments = [
+        num(challan.otherCharges) ? `<tr class="adjustment"><td></td><td style="text-align:right;font-style:italic">Cartage &amp; Forwarding</td><td></td><td></td><td></td><td style="text-align:right">${moneyRaw(challan.otherCharges)}</td></tr>` : '',
+        num(challan.roundOff) ? `<tr class="adjustment"><td></td><td style="text-align:right;font-style:italic">Round Off</td><td></td><td></td><td></td><td style="text-align:right">${num(challan.roundOff) >= 0 ? '+' : ''}${moneyRaw(challan.roundOff)}</td></tr>` : ''
+      ].join('');
+      return generateReferenceChallanHtml(challan)
+        .replace('<tr class="blank">', `${adjustments}<tr class="blank">`)
+        .replace('</style>', `</style><style>.party{grid-template-rows:30mm 1fr!important}.goods th:nth-child(1),.goods td:nth-child(1){width:6%!important}.goods th:nth-child(2),.goods td:nth-child(2){width:44%!important}.goods th:nth-child(3),.goods td:nth-child(3){width:12%!important}.goods th:nth-child(4),.goods td:nth-child(4){width:12%!important}.goods th:nth-child(5),.goods td:nth-child(5){width:10%!important}.goods th:nth-child(6),.goods td:nth-child(6){width:16%!important}.goods tbody tr:not(.blank) td{padding:.7mm 1.5mm!important}.adjustment td{font-size:14px!important}</style>`);
+    }
+
+    /** Capture the same rendered print page into a PDF, so download and preview share one visual source. */
+    async function downloadChallanVisualPdf(challan) {
+      if (!challan) return;
+      let iframe = null;
+      try {
+        notify('Generating challan PDF…');
+        if (!await loadHtml2Pdf()) throw new Error('PDF library could not be loaded.');
+        await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js', 'html2canvas-cdn');
+        if (typeof window.html2canvas !== 'function') throw new Error('PDF renderer could not be loaded.');
+        iframe = document.createElement('iframe');
+        iframe.style.cssText = 'position:fixed;left:-10000px;top:0;width:900px;height:1250px;border:0;background:#fff;';
+        document.body.appendChild(iframe);
+        const frameDoc = iframe.contentDocument || iframe.contentWindow.document;
+        frameDoc.open();
+        frameDoc.write(challanPrintHtml(challan));
+        frameDoc.close();
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const page = frameDoc.querySelector('.page');
+        if (!page) throw new Error('Could not render challan page.');
+        const canvas = await window.html2canvas(page, { scale: 2, backgroundColor: '#ffffff', logging: false, useCORS: true });
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
+        doc.addImage(canvas.toDataURL('image/png'), 'PNG', 5, 4, 200, 282, undefined, 'FAST');
+        const safeNo = String(challan.number || 'challan').replace(/[\\/:*?"<>|]/g, '-');
+        downloadBlob(`challan-${safeNo}.pdf`, doc.output('blob'));
+        notify(`PDF downloaded: challan-${safeNo}.pdf`);
+      } catch (err) {
+        console.error('Challan visual PDF download failed:', err);
+        notify(err?.message || 'Challan PDF download failed.');
+      } finally {
+        try { iframe?.remove(); } catch (e) {}
+      }
+    }
+
+    async function downloadChallan(challan) {
+      return downloadChallanVisualPdf(challan);
+      /* Legacy text-PDF implementation retained below for reference; the visual renderer above is used. */
+      if (!challan) return;
+      try {
+        notify('Generating challan PDF…');
+        if (!await loadHtml2Pdf()) throw new Error('PDF library could not be loaded.');
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ unit: 'mm', format: 'a4', compress: true });
+        const x0 = 5, x1 = 205, y0 = 4, y1 = 286, cols = [5, 17, 105, 129, 153, 170, 205];
+        const s = invoiceSupplier(challan), items = challan.items || [];
+        const address = supplierAddressLines(s).join(', ');
+        const line = (xA, yA, xB, yB) => doc.line(xA, yA, xB, yB);
+        const cellText = (value, x, y, opts = {}) => doc.text(String(value || ''), x, y, opts);
+        doc.setDrawColor(90); doc.setLineWidth(.25); doc.rect(x0, y0, 200, 282);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(15.5); cellText('DELIVERY CHALLAN', 105, 10, { align: 'center' }); line(x0, 12, x1, 12);
+        const headBottom = 79, supplierRight = 79;
+        line(x0, headBottom, x1, headBottom); line(supplierRight, 12, supplierRight, headBottom);
+        line(x0, 30, supplierRight, 30);
+        doc.setFontSize(13.5); cellText(s.businessName || 'ROYAL SANITATION', 7, 18);
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); cellText(address, 7, 22);
+        cellText(supplierContactLine(s), 7, 26);
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); cellText('Buyer', 7, 35);
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(12.5); cellText(challan.partyName || '—', 7, 41);
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(10.5); cellText(challan.address || '', 7, 46);
+        if (challan.phone) cellText('Phone: ' + challan.phone, 7, 51);
+        const meta = [['Challan No.', challan.number, 'Dated', fmtTallyDate(challan.date)], ['Delivery Note', '', 'Mode/Terms of Payment', ''], ["Supplier's Ref.", '', 'Other Reference(s)', ''], ["Buyer's Order No.", '', 'Dated', ''], ['Dispatch Document No.', '', 'Dated', ''], ['Dispatched through', '', 'Destination', '']];
+        const mx = 142, rowH = 9.2; line(mx, 12, mx, 67.2);
+        meta.forEach((r, i) => { const y = 12 + i * rowH; line(supplierRight, y + rowH, x1, y + rowH); doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); cellText(r[0], supplierRight + 2, y + 3); cellText(r[2], mx + 2, y + 3); doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); cellText(r[1], supplierRight + 2, y + 7); cellText(r[3], mx + 2, y + 7); });
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); cellText('Terms of Delivery', supplierRight + 2, 72);
+        const itemTop = 79, headH = 7, itemY = itemTop + headH, totalY = 237;
+        cols.slice(1, -1).forEach(x => line(x, itemTop, x, totalY + 7)); line(x0, itemY, x1, itemY);
+        doc.setFontSize(9.5); const labels = ['Sl\nNo.', 'Description of Goods', 'Quantity', 'Rate', 'per', 'Amount'];
+        labels.forEach((label, i) => cellText(label, (cols[i] + cols[i + 1]) / 2, itemTop + 3, { align: 'center' }));
+        let y = itemY; const rows = items.map(it => ({ desc: titleCase(it.description), qty: num(it.qty).toFixed(2), rate: moneyRaw(it.rate), unit: it.unit || 'pcs', amount: moneyRaw(it.amount) }));
+        if (num(challan.otherCharges)) rows.push({ desc: 'Cartage & Forwarding', amount: moneyRaw(challan.otherCharges), charge: true });
+        if (num(challan.roundOff)) rows.push({ desc: 'Round Off', amount: (num(challan.roundOff) >= 0 ? '+' : '') + moneyRaw(challan.roundOff), charge: true });
+        rows.forEach((r, i) => { y += 6; line(x0, y, x1, y); doc.setFont('helvetica', r.charge ? 'italic' : 'bold'); doc.setFontSize(10.5); if (!r.charge) cellText(i + 1, 11, y - 2, { align: 'center' }); cellText(r.desc, r.charge ? 103 : 19, y - 2, { align: r.charge ? 'right' : 'left' }); doc.setFont('helvetica', 'normal'); if (!r.charge) { cellText(r.qty, 127, y - 2, { align: 'right' }); cellText(r.rate, 151, y - 2, { align: 'right' }); cellText(r.unit, 161.5, y - 2, { align: 'center' }); } cellText(r.amount, 203, y - 2, { align: 'right' }); });
+        line(x0, totalY, x1, totalY); doc.setFont('helvetica', 'bold'); doc.setFontSize(11.5); cellText('Total', 103, totalY + 4.5, { align: 'right' }); cellText(items.reduce((n, it) => n + num(it.qty), 0).toFixed(2) + ' ' + (items[0]?.unit || 'pcs'), 127, totalY + 4.5, { align: 'right' }); cellText(moneyRaw(challan.grandTotal), 203, totalY + 4.5, { align: 'right' });
+        line(x0, 244, x1, 244); doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); cellText('Amount Chargeable (in words)', 7, 248); doc.setFont('helvetica', 'bold'); doc.setFontSize(11.5); cellText(numberWordsINR(challan.grandTotal), 7, 253);
+        line(x0, 259, x1, 259); line(105, 259, 105, 280); doc.setFontSize(10.5); cellText('Declaration', 7, 264); doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); doc.splitTextToSize('We declare that this challan shows the actual goods described and that all particulars are true and correct.', 92).forEach((t, i) => cellText(t, 7, 268 + i * 3.5)); doc.setFont('helvetica', 'bold'); doc.setFontSize(10.5); cellText('for ' + (s.businessName || 'ROYAL SANITATION'), 203, 264, { align: 'right' }); cellText(s.signatory || 'Authorised Signatory', 203, 277, { align: 'right' });
+        line(x0, 280, x1, 280); doc.setFont('helvetica', 'normal'); doc.setFontSize(9.5); cellText('This is a Computer Generated Challan', 105, 284, { align: 'center' });
+        const safeNo = String(challan.number || 'challan').replace(/[\\/:*?"<>|]/g, '-');
+        downloadBlob(`challan-${safeNo}.pdf`, doc.output('blob'));
+        notify(`PDF downloaded: challan-${safeNo}.pdf`);
+      } catch (err) {
+        console.error('Challan PDF download failed:', err);
+        notify(err?.message || 'Challan PDF download failed.');
+      }
+    }
+
+    function printChallan(challan, preview = false) {
+      const printHtml = challanPrintHtml(challan);
+      if (preview) {
+        const win = window.open('', '_blank');
+        if (!win) return notify('Pop-up blocked. Please allow pop-ups to preview challans.');
+        win.document.write(printHtml); win.document.close(); return;
+      }
+      const existing = document.getElementById('__challan_print_iframe__');
+      if (existing) existing.remove();
+      const iframe = document.createElement('iframe');
+      iframe.id = '__challan_print_iframe__';
+      iframe.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;border:0;opacity:0;pointer-events:none;';
+      document.body.appendChild(iframe);
+      const doc = iframe.contentDocument || iframe.contentWindow.document;
+      doc.open(); doc.write(printHtml); doc.close();
+      const cleanup = () => { try { iframe.remove(); } catch (e) {} window.removeEventListener('afterprint', cleanup); };
+      window.addEventListener('afterprint', cleanup);
+      setTimeout(() => { iframe.contentWindow.focus(); iframe.contentWindow.print(); setTimeout(cleanup, 2500); }, 350);
+    }
+
     /** Load jsPDF on demand (used to write a real text PDF, not a picture). */
     async function loadHtml2Pdf() {
       const ready = () => window.jspdf && typeof window.jspdf.jsPDF === 'function';
@@ -3467,6 +3700,12 @@
         const [r, b] = await Promise.all([get('Inter_400Regular.ttf'), get('Inter_700Bold.ttf')]);
         _pdfFontCache = { fontRegularB64: toB64(r), fontBoldB64: toB64(b) };
         try { _pdfFontCache.fontSemiB64 = toB64(await get('Inter_600SemiBold.ttf')); } catch (e) { /* optional weight */ }
+        // Italic face for the CGST / SGST / Cartage & Forwarding / Round Off labels (same as the print layout)
+        try {
+          const ib = await fetch('https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter@0.4.2/400Regular_Italic/Inter_400Regular_Italic.ttf')
+            .then(x => { if (!x.ok) throw new Error('font'); return x.arrayBuffer(); });
+          _pdfFontCache.fontItalicB64 = toB64(ib);
+        } catch (e) { /* falls back to a slanted standard font */ }
       } catch (err) {
         console.warn('Invoice font unavailable; using the built-in PDF font.', err);
         return {};
@@ -3517,6 +3756,11 @@
           } else {
             FACE.s = 'InterBold';
           }
+          if (H.fontItalicB64) {
+            doc.addFileToVFS('Inter-Italic.ttf', H.fontItalicB64);
+            doc.addFont('Inter-Italic.ttf', 'InterItalic', 'normal', 400, 'Identity-H');
+            FACE.i = 'InterItalic';
+          }
           FONT = 'Inter';
           RS = '₹';
         } catch (e) { FONT = 'helvetica'; RS = 'Rs. '; }
@@ -3527,11 +3771,11 @@
       doc.setDrawColor(0);
       doc.setTextColor(0);
 
-      // weight: 'r' regular, 's' semibold (600), 'b' bold (700); true/false still accepted
+      // weight: 'r' regular, 's' semibold (600), 'b' bold (700), 'i' italic; true/false still accepted
       const font = (w, size) => {
         const k = w === true ? 'b' : (w === false || w === undefined) ? 'r' : w;
         if (FONT === 'Inter') doc.setFont(FACE[k] || 'Inter', 'normal');
-        else doc.setFont('helvetica', (k === 'b' || k === 's') ? 'bold' : 'normal');
+        else doc.setFont('helvetica', k === 'i' ? 'italic' : (k === 'b' || k === 's') ? 'bold' : 'normal');
         doc.setFontSize(size);
       };
       const text = (str, x, y, o = {}) => doc.text(String(str ?? ''), x, y, o);
@@ -3748,8 +3992,9 @@
           text(moneyRaw(it.taxable), colX[8] - 1.5, ty, { align: 'right' });
         } else {
           const ty = base(y, TAX_ROW_H, 9);
-          font('r', 9);
+          font('i', 9);
           text(r.label, colX[2] - 3, ty, { align: 'right' });
+          font('r', 9);
           if (r.rate) text(r.rate, colX[5] + colW[5] / 2, ty, { align: 'center' });
           text(r.amt, colX[8] - 1.5, ty, { align: 'right' });
         }
@@ -3774,7 +4019,7 @@
         text('Amount Chargeable (in words)', X0 + 1.2, base(y + 0.4, 3.2, 7.5));
         font('b', 7.9);
         text(numberWordsINR(inv.grandTotal), X0 + 1.2, base(y + 3.6, 3.3, 7.9));
-        font('r', 7.9);
+        font('i', 7.9);
         text('E. & O.E', X1 - 1.5, base(y + 0.4, 3.2, 7.9), { align: 'right' });
         y += WORDS_H;
         ln(X0, y, X1, y);
@@ -4011,6 +4256,11 @@
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 3000);
+    }
+
+    /** Download text content (CSV / JSON backup) as a file. */
+    function downloadFile(filename, content, mimeType = 'text/plain;charset=utf-8') {
+      downloadBlob(filename, new Blob([content], { type: mimeType }));
     }
 
     /** Generate and download a PDF directly without opening the browser print dialog. */
@@ -4280,8 +4530,36 @@
       switch (action) {
         case 'new-invoice':
           editingId = null;
+          editingChallan = false;
           invoiceDraft = null;
           setPage('create');
+          break;
+
+        case 'new-challan':
+          editingId = null;
+          editingChallan = true;
+          invoiceDraft = null;
+          setPage('create-challan');
+          break;
+
+        case 'preview-challan':
+          if (db.challans.find(c => c.id === targetId)) printChallan(db.challans.find(c => c.id === targetId), true);
+          break;
+
+        case 'print-challan':
+          if (db.challans.find(c => c.id === targetId)) printChallan(db.challans.find(c => c.id === targetId), false);
+          break;
+
+        case 'download-challan':
+          if (db.challans.find(c => c.id === targetId)) downloadChallan(db.challans.find(c => c.id === targetId));
+          break;
+
+        case 'edit-challan':
+          editingId = targetId; editingChallan = true; setPage('create-challan');
+          break;
+
+        case 'delete-challan':
+          deleteChallan(targetId);
           break;
 
         case 'edit':
@@ -4331,10 +4609,17 @@
           }
           break;
 
+        case 'remove-challan-item':
+          invoiceDraft.items.splice(Number(targetIndex), 1);
+          if (!invoiceDraft.items.length) invoiceDraft.items.push(blankItem());
+          renderChallanItems();
+          document.getElementById('challan-form').dataset.dirty = '1';
+          break;
+
         case 'export-backup':
           downloadFile(
             'royal-sanitation-backup-' + new Date().toISOString().slice(0, 10) + '.json',
-            JSON.stringify(db, null, 2),
+            JSON.stringify(cloudPayload(), null, 2),
             'application/json'
           );
           notify('Full backup exported.');
@@ -4430,6 +4715,18 @@
       render();
     }
 
+    async function deleteChallan(id) {
+      const challan = (db.challans || []).find(c => c.id === id);
+      if (!challan) return;
+      const ok = await confirmBox('Delete Challan?', `Permanently delete challan ${challan.number}?`, 'Delete');
+      if (!ok) return;
+      db.challans = db.challans.filter(c => c.id !== id);
+      markDeleted('challans', id);
+      saveDB();
+      notify('Challan deleted.');
+      render();
+    }
+
     /** Delete customer with dependency check */
     async function deleteParty(id) {
       const p = db.parties.find(x => x.id === id);
@@ -4474,7 +4771,7 @@
       localStorage.removeItem(STORAGE_KEY);
       db = structuredClone(DEFAULTS);
       // Tombstone everything so other devices don't restore it on their next sync
-      ['invoices', 'parties', 'products'].forEach(k => (oldDb[k] || []).forEach(r => markDeleted(k, r && r.id)));
+      ['invoices', 'challans', 'parties', 'products'].forEach(k => (oldDb[k] || []).forEach(r => markDeleted(k, r && r.id)));
       saveDB();
       notify('All data cleared (local + cloud).');
       setPage('dashboard');
@@ -4499,8 +4796,43 @@
       if (container) container.innerHTML = invoiceTableBody(filtered);
     }
 
+    function filterChallans() {
+      const query = (document.getElementById('challan-search')?.value || '').toLowerCase();
+      const status = document.getElementById('challan-status-filter')?.value || '';
+      const fromDate = document.getElementById('challan-from-date')?.value || '';
+      const toDate = document.getElementById('challan-to-date')?.value || '';
+      const filtered = (db.challans || []).filter(c => {
+        const textMatch = [c.number, c.partyName, c.address, c.phone].join(' ').toLowerCase().includes(query);
+        return textMatch && (!status || c.status === status) && (!fromDate || c.date >= fromDate) && (!toDate || c.date <= toDate);
+      }).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+      const container = document.getElementById('challan-table-container');
+      if (container) container.innerHTML = challanTableBody(filtered);
+    }
+
     /** Bind page-specific events after render */
     function bindPageEvents() {
+      if (currentPage === 'create-challan') {
+        const form = document.getElementById('challan-form');
+        form?.addEventListener('input', () => { form.dataset.dirty = '1'; refreshChallan(); });
+        document.getElementById('add-challan-item').onclick = () => { invoiceDraft.items.push(blankItem()); renderChallanItems(); form.dataset.dirty = '1'; };
+        document.getElementById('challan-party-name').addEventListener('change', e => {
+          const p = db.parties.find(x => x.name.toLowerCase() === e.target.value.trim().toLowerCase());
+          if (p) { document.getElementById('challan-phone').value = p.phone || ''; document.getElementById('challan-address').value = p.address || ''; }
+        });
+        document.getElementById('preview-challan').onclick = () => { const c = getFormChallan(); if (!c.number || !c.date || !c.partyName) return notify('Please fill Challan Number, Date, and Customer Name first.'); printChallan(c, true); };
+        form?.addEventListener('submit', e => {
+          e.preventDefault(); const c = getFormChallan();
+          if (!c.number || !c.date || !c.partyName || !c.items.length || c.items.some(i => !i.description.trim() || num(i.qty) <= 0 || num(i.rate) < 0)) return notify('Please fill the challan, customer, and item details.');
+          if (db.challans.some(x => x.number.toLowerCase() === c.number.toLowerCase() && x.id !== editingId)) return notify('A challan with this number already exists. Please use a unique number.');
+          const existing = editingId ? db.challans.find(x => x.id === editingId) : null, now = new Date().toISOString();
+          c.id = editingId || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())); c.createdAt = existing?.createdAt || now; c.updatedAt = now;
+          if (!Array.isArray(db.challans)) db.challans = [];
+          if (existing) db.challans = db.challans.map(x => x.id === c.id ? c : x); else { db.challans.unshift(c); const n = parseInt(c.number.split('-').at(-1), 10); db.challanSeq = Math.max(Number(db.challanSeq || 1), isNaN(n) ? 1 : n + 1); }
+          if (!saveDB()) return; notify(existing ? 'Challan updated successfully.' : 'Challan created successfully.'); editingId = null; editingChallan = false; setPage('challans');
+        });
+        renderChallanItems();
+      }
+
       // Create Invoice Form bindings
       if (currentPage === 'create') {
         const form = document.getElementById('invoice-form');
@@ -4611,6 +4943,14 @@
 
           if (existing) {
             db.invoices = db.invoices.map(i => i.id === existing.id ? invData : i);
+            // If the number was changed to a higher one, keep the next auto-number ahead of it (never lowers it)
+            if (existing.number !== invData.number) {
+              const editedSeq = parseInt(String(invData.number).split('/').at(-1), 10);
+              if (!isNaN(editedSeq) && editedSeq + 1 > db.seq) {
+                db.seq = editedSeq + 1;
+                db.settings.nextNumber = db.seq;
+              }
+            }
           } else {
             db.invoices.unshift(invData);
             // Increment invoice sequence counter
@@ -4691,6 +5031,13 @@
       if (currentPage === 'invoices') {
         ['invoice-search', 'status-filter', 'from-date', 'to-date'].forEach(id => {
           document.getElementById(id)?.addEventListener('input', filterInvoices);
+        });
+      }
+
+      if (currentPage === 'challans') {
+        ['challan-search', 'challan-status-filter', 'challan-from-date', 'challan-to-date'].forEach(id => {
+          document.getElementById(id)?.addEventListener('input', filterChallans);
+          document.getElementById(id)?.addEventListener('change', filterChallans);
         });
       }
 
