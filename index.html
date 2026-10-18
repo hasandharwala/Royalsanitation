@@ -1884,7 +1884,10 @@
             <h2>Good ${greeting}.</h2>
             <p class="sub">Welcome to your Royal Sanitation GST Billing workspace.</p>
           </div>
-          <button class="primary" data-action="new-invoice">＋ Create Invoice</button>
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <button class="secondary" data-action="export-invoice-dossier">⇩ Export Invoice Dossier</button>
+            <button class="primary" data-action="new-invoice">＋ Create Invoice</button>
+          </div>
         </div>
 
         <div class="cards">
@@ -4381,6 +4384,83 @@
       }
     }
 
+    /** Open the issued-date based bulk invoice download dialog. */
+    function openInvoiceDossierDialog() {
+      const parties = [...new Set((db.invoices || []).map(inv => String(inv.partyName || '').trim()).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b));
+      const host = document.createElement('div');
+      host.className = 'modalback';
+      host.innerHTML = `
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dossier-title">
+          <h3 id="dossier-title">Export Invoice Dossier</h3>
+          <p>Download invoice PDFs by the <b>invoice issue date</b>, not the date they were created.</p>
+          <div class="formgrid" style="margin-top:18px">
+            <div class="field span4"><label>Party</label><select id="dossier-party-mode"><option value="all">All parties</option><option value="particular">Particular party</option></select></div>
+            <div class="field span4"><label>Party Name</label><input id="dossier-party" list="dossier-party-list" placeholder="Start typing a party name" disabled><datalist id="dossier-party-list">${parties.map(name => `<option value="${esc(name)}"></option>`).join('')}</datalist></div>
+            <div class="field span2"><label>From Issue Date</label><input id="dossier-from" type="date" required></div>
+            <div class="field span2"><label>To Issue Date</label><input id="dossier-to" type="date" required></div>
+          </div>
+          <div class="modalactions"><button class="secondary" type="button" id="dossier-cancel">Cancel</button><button class="primary" type="button" id="dossier-download">Download PDFs</button></div>
+        </div>`;
+      document.body.appendChild(host);
+      const remove = () => host.remove();
+      const mode = host.querySelector('#dossier-party-mode');
+      const party = host.querySelector('#dossier-party');
+      mode.onchange = () => { party.disabled = mode.value !== 'particular'; if (party.disabled) party.value = ''; };
+      host.querySelector('#dossier-cancel').onclick = remove;
+      host.addEventListener('click', e => { if (e.target === host) remove(); });
+      host.querySelector('#dossier-download').onclick = async () => {
+        const from = host.querySelector('#dossier-from').value;
+        const to = host.querySelector('#dossier-to').value;
+        const partyName = party.value.trim();
+        if (!from || !to) return notify('Choose both issue-date limits for the Invoice Dossier.');
+        if (from > to) return notify('The From Issue Date must be before the To Issue Date.');
+        if (mode.value === 'particular' && !partyName) return notify('Type the party name to export.');
+        const matching = (db.invoices || []).filter(inv => {
+          const issuedOn = String(inv.date || '');
+          const partyMatch = mode.value === 'all' || String(inv.partyName || '').trim().toLowerCase() === partyName.toLowerCase();
+          return partyMatch && issuedOn >= from && issuedOn <= to;
+        }).sort((a, b) => String(a.date || '').localeCompare(String(b.date || '')) || String(a.number || '').localeCompare(String(b.number || '')));
+        if (!matching.length) return notify('No invoices match that party and issue-date period.');
+        remove();
+        await downloadInvoiceDossier(matching, from, to);
+      };
+      setTimeout(() => host.querySelector('#dossier-from').focus(), 0);
+    }
+
+    function dossierPeriodName(from, to) {
+      const month = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+      const format = value => {
+        const [year, mon, day] = String(value).split('-').map(Number);
+        return `${String(day).padStart(2, '0')}-${month[mon - 1] || ''}`;
+      };
+      return `${format(from)} TO ${format(to)}`;
+    }
+
+    /** Generate every selected issued invoice into one period-named folder archive. */
+    async function downloadInvoiceDossier(invoices, from, to) {
+      try {
+        notify(`Preparing ${invoices.length} invoice PDF${invoices.length === 1 ? '' : 's'}…`);
+        await loadScriptOnce('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js', 'jszip-cdn');
+        if (typeof window.JSZip !== 'function') throw new Error('Invoice archive tool could not be loaded. Check your internet connection and try again.');
+        const periodName = dossierPeriodName(from, to);
+        const archive = new window.JSZip();
+        const folder = archive.folder(periodName);
+        for (let index = 0; index < invoices.length; index++) {
+          const inv = invoices[index];
+          const { blob, fileName } = await createInvoicePdfBlob(inv);
+          folder.file(`${fileName}.pdf`, blob);
+        }
+        notify('Creating your Invoice Dossier archive…');
+        const zipBlob = await archive.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+        downloadBlob(`${periodName}.zip`, zipBlob);
+        notify(`${invoices.length} invoice PDF${invoices.length === 1 ? '' : 's'} saved in ${periodName}.zip.`);
+      } catch (err) {
+        console.error('Invoice Dossier export failed:', err);
+        notify(err?.message || 'The Invoice Dossier could not be generated.');
+      }
+    }
+
     /** Generate the invoice PDF and send it directly through the secured WhatsApp backend. */
     async function shareWhatsApp(inv) {
       const s = inv.supplierSnapshot || db.settings;
@@ -4637,6 +4717,10 @@
           editingChallan = false;
           invoiceDraft = null;
           setPage('create');
+          break;
+
+        case 'export-invoice-dossier':
+          openInvoiceDossierDialog();
           break;
 
         case 'new-challan':
