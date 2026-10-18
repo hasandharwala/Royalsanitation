@@ -724,7 +724,7 @@
       padding: 12px 18px;
       border-radius: var(--radius-md);
       box-shadow: var(--shadow-lg);
-      max-width: 360px;
+      max-width: 460px;
       display: none;
       font-size: 12px;
       font-weight: 600;
@@ -975,6 +975,7 @@
     let _dbRevision = 0;
     let _savesInFlight = 0;
     let _unsubscribeLive = null;
+    let _liveRetryTimer = null;
     const PENDING_KEY = 'royalSanitationInvoiceApp_v1_pending';
 
     function loadScriptOnce(src, marker) {
@@ -1009,6 +1010,9 @@
           _fbApp = firebase.apps && firebase.apps.length ? firebase.app() : firebase.initializeApp(_fbConfig);
           _auth = firebase.auth();
           _fstore = firebase.firestore();
+          // Some office networks and proxies block Firestore's default streaming channel.
+          // Long polling uses ordinary HTTPS requests and is more reliable in those environments.
+          _fstore.settings({ experimentalForceLongPolling: true, useFetchStreams: false });
           _cloudDoc = _fstore.collection('appData').doc('main');
           return _cloudDoc;
         })().catch(err => {
@@ -1022,6 +1026,19 @@
     function queueCloudOperation(operation) {
       _cloudQueue = _cloudQueue.catch(() => {}).then(operation);
       return _cloudQueue;
+    }
+
+    function cloudErrorMessage(err) {
+      const rawCode = String(err?.code || '');
+      const code = rawCode.toLowerCase();
+      const tag = rawCode ? ` [${rawCode}]` : '';
+      const detail = err?.message ? ` Details: ${err.message}` : '';
+      if (code.includes('permission-denied')) return 'Firestore refused access (permission-denied). Check: Security Rules for appData/main, App Check enforcement on Firestore, and that the API key allows this website domain.' + tag + detail;
+      if (code.includes('unauthenticated')) return 'Your cloud sign-in session is not valid. Please sign out and sign in again.' + tag + detail;
+      if (code.includes('resource-exhausted') || code.includes('invalid-argument')) return 'Cloud save failed: the shared data document is probably over Firestore\'s 1 MB limit (logo / QR images count). Remove the logo or QR in Business Settings, or export a backup and reduce old records.' + tag + detail;
+      if (code.includes('failed-precondition') || code.includes('not-found')) return 'Firestore database is missing or not fully configured for this Firebase project (create the default Firestore database).' + tag + detail;
+      if (code.includes('unavailable') || code.includes('network') || code.includes('deadline')) return 'Cannot reach Firestore (blocked connection, firewall, extension or DNS). Your data remains saved locally and will retry when the connection returns.' + tag + detail;
+      return `Cloud error${tag}${err?.message ? `: ${err.message}` : '.'}`;
     }
 
     // Official 2-digit Indian State Codes for GST compliance
@@ -1143,6 +1160,7 @@
       queueCloudOperation(async () => {
         await initFirebase();
         if (!_auth || !_auth.currentUser) throw new Error('Sign in is required before cloud data can be saved.');
+        await _auth.currentUser.getIdToken();
         // Snapshot at execution time, not enqueue time, so earlier sync merges are not overwritten by stale snapshots.
         const snapshot = cloudPayload();
         const sentDeleted = normalizeDeleted(db.deleted);
@@ -1162,16 +1180,77 @@
       }).catch(err => {
         _savesInFlight = Math.max(0, _savesInFlight - 1);
         console.error('Cloud save failed:', err);
-        _setSyncBadge('offline');
-        notify('Could not save to the cloud. Check your internet connection and try again.');
+        const message = cloudErrorMessage(err);
+        _setSyncBadge('offline', message);
+        notify(message);
       });
       return true;
     }
 
+    /** Copy of the business settings without the (large) logo/QR images, for storing inside each invoice/challan. */
+    function snapshotSettings() {
+      const copy = { ...db.settings };
+      delete copy.logo;
+      delete copy.qr;
+      return copy;
+    }
+
+    /** Older records carried a full copy of the logo and QR image each; remove them (print/PDF use the live images). */
+    function stripRecordImages(list) {
+      (Array.isArray(list) ? list : []).forEach(r => {
+        if (r && r.supplierSnapshot) { delete r.supplierSnapshot.logo; delete r.supplierSnapshot.qr; }
+      });
+    }
+
+    /** Downscale an image data URL so it stays small (a logo/QR never needs more than ~400px). */
+    function shrinkDataUrl(src, maxDim = 400) {
+      return new Promise(resolve => {
+        const safe = safeImageSrc(src);
+        if (!safe || !safe.startsWith('data:image/')) return resolve(src);
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const scale = Math.min(1, maxDim / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+            const w = Math.max(1, Math.round((img.naturalWidth || 1) * scale));
+            const h = Math.max(1, Math.round((img.naturalHeight || 1) * scale));
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            c.getContext('2d').drawImage(img, 0, 0, w, h);
+            const out = c.toDataURL('image/png');
+            resolve(out.length < src.length ? out : src);
+          } catch (e) { resolve(src); }
+        };
+        img.onerror = () => resolve(src);
+        img.src = safe;
+      });
+    }
+
+    /** One-time cleanup: shrink an oversized logo/QR already stored on this device (no cloud write; it just keeps local data small). */
+    async function shrinkStoredImages() {
+      let changed = false;
+      for (const k of ['logo', 'qr']) {
+        const v = db.settings[k];
+        if (v && v.length > 120000) {
+          const smaller = await shrinkDataUrl(v, 400);
+          if (smaller !== v) { db.settings[k] = smaller; changed = true; }
+        }
+      }
+      stripRecordImages(db.invoices);
+      stripRecordImages(db.challans);
+      if (changed) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(db)); } catch (e) {} }
+    }
+
     /** What gets stored in the cloud: all live data, with no delete markers, so deleted records leave no trace. */
     function cloudPayload() {
+      stripRecordImages(db.invoices);
+      stripRecordImages(db.challans);
       const copy = JSON.parse(JSON.stringify(db));
       copy.deleted = { invoices: [], challans: [], parties: [], products: [] };
+      try {
+        const bytes = new Blob([JSON.stringify(copy)]).size;
+        const pct = Math.round(bytes / 1048576 * 100);
+        if (pct >= 80) setTimeout(() => notify(`Warning: cloud data is ${pct}% of Firestore's 1 MB limit. Export a backup and tell your developer to enable multi-document storage.`), 0);
+      } catch (e) {}
       return copy;
     }
 
@@ -1209,7 +1288,12 @@
         else render();
       }, err => {
         console.error('Live sync error:', err);
-        _setSyncBadge('offline');
+        _setSyncBadge('offline', cloudErrorMessage(err));
+        // Drop the dead listener so it can be restarted instead of staying offline forever.
+        try { if (_unsubscribeLive) _unsubscribeLive(); } catch (e) {}
+        _unsubscribeLive = null;
+        clearTimeout(_liveRetryTimer);
+        _liveRetryTimer = setTimeout(() => { if (_auth && _auth.currentUser) startLiveSync(); }, 20000);
       });
     }
 
@@ -1218,9 +1302,17 @@
     }
 
     /** Update the cloud sync status badge */
-    function _setSyncBadge(status) {
+    function _setSyncBadge(status, detail = '') {
       const el = document.getElementById('sync-badge');
       if (!el) return;
+      el.title = detail || '';
+      el.onclick = status === 'offline'
+        ? () => {
+            notify(detail || 'Cloud connection failed. Retrying… open the browser console (F12) for details.');
+            if (_auth && _auth.currentUser) { stopLiveSync(); syncFromCloud(); }
+          }
+        : null;
+      el.style.cursor = status === 'offline' ? 'pointer' : 'default';
       if (status === 'saving') {
         el.textContent = '⟳ Saving…';
         el.style.background = '#fffbe6';
@@ -1312,6 +1404,7 @@
             seq: Math.max(cloudSeq, localSeq),
             challanSeq: Math.max(Number(cloudData.challanSeq || 1), Number(localData.challanSeq || 1))
           };
+          ['logo', 'qr'].forEach(k => { if (!db.settings[k] && localData.settings && localData.settings[k]) db.settings[k] = localData.settings[k]; });
           localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
           const hasLocalOnly = (localRecords, cloudRecords, kind) => {
             const cloudIds = new Set((Array.isArray(cloudRecords) ? cloudRecords : []).map(x => String(x && x.id || '')));
@@ -1334,7 +1427,9 @@
         });
       } catch (err) {
         console.error('Cloud sync error:', err);
-        _setSyncBadge('offline');
+        const message = cloudErrorMessage(err);
+        _setSyncBadge('offline', message);
+        notify(message);
       }
       startLiveSync();
     }
@@ -1463,7 +1558,7 @@
       toast.textContent = message;
       toast.classList.add('show');
       clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => toast.classList.remove('show'), 3200);
+      toastTimer = setTimeout(() => toast.classList.remove('show'), Math.min(15000, 3200 + String(message).length * 45));
     }
 
     /** Modal Confirmation Box returning a Promise */
@@ -2260,7 +2355,7 @@
         roundOff: calc.roundOff || 0,
         grandTotal: calc.grandTotal || 0,
         notes: db.settings.terms,
-        supplierSnapshot: { ...db.settings },
+        supplierSnapshot: snapshotSettings(),
         updatedAt: new Date().toISOString()
       };
     }
@@ -2329,7 +2424,7 @@
       refreshChallan();
     }
     function refreshChallan() { const result = calculateChallan(); if (result) document.querySelectorAll('.challan-item-amount').forEach((el, i) => el.textContent = money(result.items[i]?.amount)); }
-    function getFormChallan() { const calc = calculateChallan() || {}; return { ...invoiceDraft, id: editingId || invoiceDraft.id || crypto.randomUUID(), number: document.getElementById('challan-number').value.trim(), date: document.getElementById('challan-date').value, status: document.getElementById('challan-status').value, partyName: titleCase(document.getElementById('challan-party-name').value.trim()), phone: document.getElementById('challan-phone').value.trim(), address: titleCase(document.getElementById('challan-address').value.trim()), items: calc.items || [], taxable: calc.subtotal || 0, discount: calc.discount || 0, otherCharges: calc.otherCharges || 0, roundOff: calc.roundOff || 0, grandTotal: calc.grandTotal || 0, supplierSnapshot: { ...db.settings } }; }
+    function getFormChallan() { const calc = calculateChallan() || {}; return { ...invoiceDraft, id: editingId || invoiceDraft.id || crypto.randomUUID(), number: document.getElementById('challan-number').value.trim(), date: document.getElementById('challan-date').value, status: document.getElementById('challan-status').value, partyName: titleCase(document.getElementById('challan-party-name').value.trim()), phone: document.getElementById('challan-phone').value.trim(), address: titleCase(document.getElementById('challan-address').value.trim()), items: calc.items || [], taxable: calc.subtotal || 0, discount: calc.discount || 0, otherCharges: calc.otherCharges || 0, roundOff: calc.roundOff || 0, grandTotal: calc.grandTotal || 0, supplierSnapshot: snapshotSettings() }; }
 
     /* --- View 4: Customers / Parties --- */
     function partiesHTML() {
@@ -5076,8 +5171,8 @@
             return;
           }
           const reader = new FileReader();
-          reader.onload = () => {
-            db.settings.logo = reader.result;
+          reader.onload = async () => {
+            db.settings.logo = await shrinkDataUrl(reader.result, 400);
             saveDB();
             render();
             notify('Logo uploaded.');
@@ -5095,8 +5190,8 @@
             return;
           }
           const reader = new FileReader();
-          reader.onload = () => {
-            db.settings.qr = reader.result;
+          reader.onload = async () => {
+            db.settings.qr = await shrinkDataUrl(reader.result, 400);
             saveDB();
             render();
             notify('QR code uploaded.');
@@ -5281,7 +5376,7 @@
           authGate.style.display = 'none';
           showAuthError('');
           render();
-          syncFromCloud();
+          shrinkStoredImages().catch(() => {}).then(() => syncFromCloud());
         } else {
           stopLiveSync();
           document.body.classList.remove('authenticated');
